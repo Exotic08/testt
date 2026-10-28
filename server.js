@@ -1179,6 +1179,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Claudex Workspace</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23D97757'/%3E%3C/svg%3E" />
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/atom-one-dark.min.css" />
@@ -2330,11 +2331,20 @@ function renderTurnError(turn, message) {
 function refreshTimelineBlock(block) {
   if (!block || !block.el) return;
   const stack = block.el.querySelector('.action-stack');
+  if (!stack) return;
   const arrow = block.el.querySelector('.timeline-arrow');
   const summaryEl = block.el.querySelector('.timeline-summary');
-  if (!stack || !inner2(stack)) return;
-  const inner = inner2(stack);
+  let inner = stack.querySelector('.action-stack-inner');
+  if (!inner) {
+    inner = document.createElement('div');
+    inner.className = 'action-stack-inner';
+    stack.appendChild(inner);
+  }
   const wasOpen = stack.classList.contains('is-open');
+  const openIds = {};
+  Array.from(inner.children).forEach((row) => {
+    if (row.classList.contains('is-open') && row.dataset.stepId) openIds[row.dataset.stepId] = true;
+  });
   inner.innerHTML = '';
   if (block.running && (!block.entries || block.entries.length === 0)) {
     const waiting = document.createElement('div');
@@ -2350,7 +2360,7 @@ function refreshTimelineBlock(block) {
   }
   (block.entries || []).forEach((step) => {
     const row = buildStepRow(step);
-    if (step.open) row.classList.add('is-open');
+    if (step.open || openIds[step.id]) row.classList.add('is-open');
     inner.appendChild(row);
   });
   if (wasOpen) stack.classList.add('is-open');
@@ -2413,6 +2423,7 @@ function handleSseEvent(turn, event, data) {
       open: false
     });
     refreshTimelineBlock(block);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'step_done') {
@@ -2433,6 +2444,7 @@ function handleSseEvent(turn, event, data) {
       args: data.args
     });
     refreshTimelineBlock(block);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'artifact_update') {
@@ -2464,11 +2476,13 @@ function handleSseEvent(turn, event, data) {
       open: false
     });
     refreshTimelineBlock(block);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'text_delta') {
     assistant.content = data.text || assistant.content || '';
     renderTurnBody(turn);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'final_reply') {
@@ -2481,6 +2495,7 @@ function handleSseEvent(turn, event, data) {
     }
     renderTurnBody(turn);
     renderTurnArtifacts(turn);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'error') {
@@ -2493,6 +2508,7 @@ function handleSseEvent(turn, event, data) {
     }
     renderTurnBody(turn);
     renderTurnError(turn, assistant.error);
+    persistTurnMessage(turn);
     return;
   }
   if (event === 'done') {
@@ -2509,6 +2525,53 @@ function handleSseEvent(turn, event, data) {
 
 const SSE_FRAME_SEPARATOR = String.fromCharCode(10, 10);
 
+function serializeTimeline(block) {
+  if (!block) return null;
+  return {
+    entries: (block.entries || []).map((entry) => ({
+      id: entry.id,
+      index: entry.index,
+      name: entry.name,
+      kind: entry.kind,
+      summary: entry.summary,
+      file: entry.file,
+      fileIsCommand: entry.fileIsCommand,
+      args: entry.args,
+      status: entry.status,
+      durationMs: entry.durationMs,
+      detail: entry.detail,
+      open: false
+    })),
+    running: Boolean(block.running),
+    collapsed: Boolean(block.collapsed)
+  };
+}
+
+function persistTurnMessage(turn) {
+  if (!turn || !turn.el) return;
+  const chat = activeChat();
+  if (!chat) return;
+  const record = chat.messages.find((item) => item.id === turn.id);
+  if (!record || !record.assistant) return;
+  const assistant = turn.assistant || {};
+  record.assistant.content = assistant.content || '';
+  record.assistant.streaming = Boolean(assistant.streaming);
+  record.assistant.error = assistant.error || null;
+  record.assistant.model = assistant.model || record.assistant.model || null;
+  record.assistant.artifacts = (assistant.artifacts || []).map((artifact) => ({
+    filepath: artifact.filepath,
+    filename: artifact.filename,
+    ext: artifact.ext,
+    kind: artifact.kind,
+    action: artifact.action,
+    size: artifact.size,
+    sizeHuman: artifact.sizeHuman
+  }));
+  record.assistant.timeline = serializeTimeline(assistant.timeline);
+  chat.updatedAt = Date.now();
+  persistChats();
+}
+
 function parseSseFrame(frame) {
   const lines = frame.split(String.fromCharCode(10));
   let event = 'message';
@@ -2523,6 +2586,22 @@ function parseSseFrame(frame) {
   } catch (err) {
     return null;
   }
+}
+
+function normalizeSseFrame(frame) {
+  const rewritten = frame
+    .split(String.fromCharCode(13, 10))
+    .join(String.fromCharCode(10))
+    .split(String.fromCharCode(13))
+    .join(String.fromCharCode(10))
+    .split(String.fromCharCode(10))
+    .map((line) => {
+      if (line.startsWith('data:')) return 'data:' + line.slice(5).trim();
+      if (line.startsWith('event:')) return 'event:' + line.slice(6).trim();
+      return line;
+    })
+    .join(String.fromCharCode(10));
+  return rewritten;
 }
 
 async function streamChat(payload, turn) {
@@ -2559,7 +2638,7 @@ async function streamChat(payload, turn) {
     while (idx !== -1) {
       const frame = buffer.slice(0, idx);
       buffer = buffer.slice(idx + SSE_FRAME_SEPARATOR.length);
-      const parsed = parseSseFrame(frame);
+      const parsed = parseSseFrame(normalizeSseFrame(frame));
       if (parsed && parsed.payload && parsed.payload.data) {
         handleSseEvent(turn, parsed.payload.event || parsed.event, parsed.payload.data);
       }
@@ -2567,7 +2646,7 @@ async function streamChat(payload, turn) {
     }
   }
   if (buffer.trim()) {
-    const parsed = parseSseFrame(buffer);
+    const parsed = parseSseFrame(normalizeSseFrame(buffer));
     if (parsed && parsed.payload && parsed.payload.data) {
       handleSseEvent(turn, parsed.payload.event || parsed.event, parsed.payload.data);
     }
@@ -2586,6 +2665,25 @@ function loadSettings() {
 
 function saveSettingsToStorage() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state.settings));
+}
+
+function migrateLegacyStorage() {
+  const pairs = [
+    ['claudex_workspace_chats_v1', CHATS_KEY],
+    ['claudex_workspace_settings_v1', STORAGE_KEY]
+  ];
+  pairs.forEach((pair) => {
+    const legacyKey = pair[0];
+    const targetKey = pair[1];
+    try {
+      const legacy = localStorage.getItem(legacyKey);
+      if (legacy && !localStorage.getItem(targetKey)) {
+        localStorage.setItem(targetKey, legacy);
+      }
+    } catch (err) {
+      /* storage unavailable */
+    }
+  });
 }
 
 function loadChats() {
@@ -2690,6 +2788,22 @@ function buildTurnFromRecord(record) {
   return turn;
 }
 
+const RENDER_ERROR_BANNER_ID = 'renderErrorBanner';
+
+function showRenderErrorBanner(message) {
+  const existing = el(RENDER_ERROR_BANNER_ID);
+  if (existing) existing.remove();
+  const banner = document.createElement('div');
+  banner.id = RENDER_ERROR_BANNER_ID;
+  banner.className = 'turn-error';
+  banner.style.margin = '12px auto 0';
+  banner.style.maxWidth = '760px';
+  banner.textContent = 'Lỗi hiển thị tin nhắn: ' + message + ' — nhấn vào để tải lại trang.';
+  banner.addEventListener('click', () => window.location.reload());
+  const scroller = el('chatScroll');
+  if (scroller) scroller.insertBefore(banner, scroller.firstChild);
+}
+
 function renderMessages() {
   const chat = activeChat();
   const welcome = el('welcome');
@@ -2697,28 +2811,48 @@ function renderMessages() {
   const title = el('chatTitle');
   messages.innerHTML = '';
   if (!chat || chat.messages.length === 0) {
-    welcome.classList.remove('hidden');
-    messages.classList.add('hidden');
+    welcome.classList.remove('is-hidden');
+    messages.classList.add('is-hidden');
     title.textContent = 'New chat';
     return;
   }
-  welcome.classList.add('hidden');
-  messages.classList.remove('hidden');
+  welcome.classList.add('is-hidden');
+  messages.classList.remove('is-hidden');
   title.textContent = chat.title || 'Chat';
   for (const record of chat.messages) {
-    const turn = buildTurnFromRecord(record);
-    normalizeRestoredTurn(turn);
-    const node = buildTurnEl(turn);
-    turn.el = node;
-    if (turn.assistant.timeline) {
-      const timelineEl = node.querySelector('.timeline');
-      if (timelineEl) turn.assistant.timeline.el = timelineEl;
+    try {
+      renderSingleRecord(messages, record);
+    } catch (err) {
+      console.error('[render message]', err);
+      showRenderErrorBanner(errorMessage(err));
+      const fallback = document.createElement('div');
+      fallback.className = 'turn';
+      const bubble = document.createElement('div');
+      bubble.className = 'user-bubble';
+      bubble.textContent = (record.user && record.user.content) || '';
+      const body = document.createElement('div');
+      body.className = 'md-body';
+      body.textContent = (record.assistant && record.assistant.content) || '(không hiển thị được nội dung cũ)';
+      fallback.appendChild(bubble);
+      fallback.appendChild(body);
+      messages.appendChild(fallback);
     }
-    const bodyEl = node.querySelector('.md-body');
-    if (bodyEl && turn.assistant.content) bodyEl.dataset.rendered = turn.assistant.content;
-    messages.appendChild(node);
   }
   scrollToBottom();
+}
+
+function renderSingleRecord(messages, record) {
+  const turn = buildTurnFromRecord(record);
+  normalizeRestoredTurn(turn);
+  const node = buildTurnEl(turn);
+  turn.el = node;
+  if (turn.assistant.timeline) {
+    const timelineEl = node.querySelector('.timeline');
+    if (timelineEl) turn.assistant.timeline.el = timelineEl;
+  }
+  const bodyEl = node.querySelector('.md-body');
+  if (bodyEl && turn.assistant.content) bodyEl.dataset.rendered = turn.assistant.content;
+  messages.appendChild(node);
 }
 
 function scrollToBottom() {
@@ -2736,10 +2870,10 @@ function renderAttachments() {
   const bar = el('attachmentBar');
   bar.innerHTML = '';
   if (!state.attachments.length) {
-    bar.classList.add('hidden');
+    bar.classList.add('is-hidden');
     return;
   }
-  bar.classList.remove('hidden');
+  bar.classList.remove('is-hidden');
   state.attachments.forEach((attachment, idx) => {
     const chip = document.createElement('div');
     chip.className = 'attach-chip';
@@ -2787,6 +2921,9 @@ async function sendMessage() {
     assistant: { timeline: { entries: [], running: true, collapsed: true }, content: '', artifacts: [], streaming: true, error: null }
   };
   chat.messages.push(record);
+  const holder = el('messages');
+  holder.classList.remove('is-hidden');
+  el('welcome').classList.add('is-hidden');
   if (chat.title === 'New chat') {
     chat.title = (text || attachments[0] || 'New chat').slice(0, 48);
   }
@@ -3484,22 +3621,58 @@ function bindEvents() {
 }
 
 async function init() {
+  migrateLegacyStorage();
   loadSettings();
   loadChats();
   resumeInterruptedChats();
   if (!state.chats.length) createChat();
   else if (!state.activeChatId) state.activeChatId = state.chats[0].id;
-  renderChatList();
-  renderMessages();
+  try {
+    renderChatList();
+  } catch (err) {
+    console.error('[chat list]', err);
+  }
+  try {
+    renderMessages();
+  } catch (err) {
+    console.error('[messages]', err);
+    el('welcome').classList.remove('is-hidden');
+    el('messages').classList.add('is-hidden');
+  }
   setModelBadge();
   bindEvents();
+  window.__claudexReady = true;
   fetchStats();
   setInterval(fetchStats, 10000);
   refreshFileTree();
   el('input').focus();
+  window.addEventListener('pageshow', () => {
+    if (!activeChat() || activeChat().messages.length === 0) {
+      el('welcome').classList.remove('is-hidden');
+      el('messages').classList.add('is-hidden');
+    }
+  });
 }
 
-window.addEventListener('DOMContentLoaded', init);
+function bootFallback() {
+  if (window.__claudexReady) return;
+  try {
+    init();
+  } catch (err) {
+    console.error('[boot]', err);
+    const target = document.getElementById('welcome');
+    if (target) target.classList.remove('is-hidden');
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootFallback);
+} else {
+  setTimeout(bootFallback, 0);
+}
+setTimeout(bootFallback, 4000);
+
+
 
 </script>
 </body>
