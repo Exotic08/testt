@@ -8,7 +8,7 @@ import { exec, execSync } from 'child_process';
 
 dotenv.config();
 
-const WORKSPACE_ROOT = fs.existsSync('/home/container') ? '/home/container' : process.cwd();
+const DEFAULT_WORKSPACE_ROOT = fs.existsSync('/home/container') ? '/home/container' : process.cwd();
 const PORT = parseInt(process.env.SERVER_PORT || '3000', 10);
 const HOST = '0.0.0.0';
 const DEFAULT_TIMEOUT = 45000;
@@ -22,22 +22,140 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-function safePath(relPath) {
-  const raw = (relPath === undefined || relPath === null) ? '' : String(relPath);
-  const cleaned = raw.replace(/^[/\\]+/, '');
-  const resolved = path.resolve(WORKSPACE_ROOT, cleaned);
-  const rootResolved = path.resolve(WORKSPACE_ROOT);
+const WORKSPACE_MODES = ['auto', 'picker', 'root'];
+
+function normalizeRootPath(relPath) {
+  return String(relPath === undefined || relPath === null ? '' : relPath)
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+}
+
+function assertInsideRoot(root, abs) {
+  const rootResolved = path.resolve(root);
+  const resolved = path.resolve(abs);
   if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
-    const err = new Error('Path traversal detected: ' + raw);
+    const err = new Error('Path traversal detected: ' + abs);
     err.statusCode = 400;
     throw err;
   }
   return resolved;
 }
 
-function toRelative(absPath) {
-  const rel = path.relative(WORKSPACE_ROOT, absPath);
+function normalizeWorkspaceMode(mode) {
+  const value = String(mode || '').trim().toLowerCase();
+  return WORKSPACE_MODES.includes(value) ? value : 'root';
+}
+
+function resolveWorkspaceRoot(input) {
+  const raw = (input === undefined || input === null) ? '' : String(input).trim();
+  if (!raw || raw === '.' || raw === './' || raw === '/') return DEFAULT_WORKSPACE_ROOT;
+  const candidate = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(DEFAULT_WORKSPACE_ROOT, raw);
+  assertInsideRoot(DEFAULT_WORKSPACE_ROOT, candidate);
+  if (!fs.existsSync(candidate)) {
+    throw new Error('Workspace không tồn tại: ' + raw);
+  }
+  if (!fs.statSync(candidate).isDirectory()) {
+    throw new Error('Workspace phải là thư mục: ' + raw);
+  }
+  return candidate;
+}
+
+function prepareWorkspace(input) {
+  const mode = normalizeWorkspaceMode(input && input.mode);
+  const requested = input && input.workspaceRoot ? String(input.workspaceRoot).trim() : '';
+  let relative = '';
+  let created = false;
+  let selection = '';
+
+  if (mode === 'auto') {
+    relative = requested || 'workspace-' + new Date().toISOString().slice(0, 10);
+    relative = normalizeRootPath(relative);
+    if (!relative) {
+      throw new Error('Tên workspace tự tạo không hợp lệ');
+    }
+    const abs = assertInsideRoot(DEFAULT_WORKSPACE_ROOT, path.join(DEFAULT_WORKSPACE_ROOT, relative));
+    if (!fs.existsSync(abs)) {
+      fs.mkdirSync(abs, { recursive: true });
+      created = true;
+    } else if (!fs.statSync(abs).isDirectory()) {
+      throw new Error('Đường dẫn đã tồn tại và không phải thư mục: ' + relative);
+    }
+    selection = relative;
+  } else if (mode === 'picker') {
+    relative = normalizeRootPath(requested);
+    if (!relative) {
+      throw new Error('Hãy chọn hoặc nhập workspace trước khi gửi, hoặc chuyển sang chế độ tự tạo.');
+    }
+    const abs = resolveWorkspaceRoot(relative);
+    relative = toRelativeAt(abs, DEFAULT_WORKSPACE_ROOT);
+    selection = relative;
+  } else {
+    relative = '';
+    selection = '.';
+  }
+
+  return {
+    mode: mode,
+    root: resolveWorkspaceRoot(relative),
+    relative: relative,
+    label: relative || 'thư mục gốc',
+    created: created,
+    selection: selection
+  };
+}
+
+const PROTECTED_ROOT_ENTRIES = new Set([
+  'server.js',
+  'package.json',
+  'package-lock.json',
+  'node_modules',
+  '.git',
+  '.env',
+  '.env.example',
+  '.gitignore'
+]);
+
+function isProtectedRootEntry(entryName) {
+  const name = String(entryName || '').replace(/^\/+/, '').split('/')[0];
+  return PROTECTED_ROOT_ENTRIES.has(name);
+}
+
+class GuardedDeleteError extends Error {
+  constructor(message, statusCode) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+function guardedDelete(abs, root) {
+  if (path.resolve(abs) === path.resolve(root)) {
+    throw new GuardedDeleteError('Không thể xóa thư mục gốc của workspace', 400);
+  }
+  const relToDefault = toRelativeAt(abs, DEFAULT_WORKSPACE_ROOT);
+  if (path.resolve(abs) === path.resolve(DEFAULT_WORKSPACE_ROOT)) {
+    throw new GuardedDeleteError('Không thể xóa thư mục gốc của ứng dụng', 400);
+  }
+  if (isProtectedRootEntry(relToDefault)) {
+    throw new GuardedDeleteError('File hệ thống của ứng dụng không thể xóa ở chế độ không workspace: ' + relToDefault, 403);
+  }
+  fs.rmSync(abs, { recursive: true, force: true });
+}
+
+function toRelativeAt(absPath, root) {
+  const rel = path.relative(root || DEFAULT_WORKSPACE_ROOT, absPath);
   return rel.split(path.sep).join('/');
+}
+
+function safePath(relPath, root) {
+  const base = root || DEFAULT_WORKSPACE_ROOT;
+  const raw = (relPath === undefined || relPath === null) ? '' : String(relPath);
+  const cleaned = raw.replace(/^[/\\]+/, '');
+  return assertInsideRoot(base, path.resolve(base, cleaned));
+}
+
+function toRelative(absPath, root) {
+  return toRelativeAt(absPath, root || DEFAULT_WORKSPACE_ROOT);
 }
 
 function formatSize(bytes) {
@@ -160,7 +278,8 @@ function buildTree(list) {
   return root;
 }
 
-function toolExecuteCommand(args) {
+function toolExecuteCommand(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const command = String((args && args.command) || '').trim();
   if (!command) {
     return Promise.resolve({ ok: false, stdout: '', stderr: 'Empty command', exitCode: 1, command: '' });
@@ -169,7 +288,7 @@ function toolExecuteCommand(args) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = DEFAULT_TIMEOUT;
   if (timeoutMs > 300000) timeoutMs = 300000;
   return new Promise((resolve) => {
-    exec(command, { cwd: WORKSPACE_ROOT, timeout: timeoutMs, maxBuffer: MAX_BUFFER, shell: '/bin/bash', env: process.env }, (error, stdout, stderr) => {
+    exec(command, { cwd: root, timeout: timeoutMs, maxBuffer: MAX_BUFFER, shell: '/bin/bash', env: process.env }, (error, stdout, stderr) => {
       let exitCode = 0;
       let out = stdout || '';
       let errOut = stderr || '';
@@ -186,19 +305,20 @@ function toolExecuteCommand(args) {
         stderr: truncateText(errOut, 60000),
         exitCode,
         command,
-        cwd: WORKSPACE_ROOT
+        cwd: root
       });
     });
   });
 }
 
-function toolWriteFile(args) {
+function toolWriteFile(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const filepath = String((args && args.filepath) || '').trim();
   if (!filepath) return { ok: false, error: 'filepath is required' };
   const content = typeof (args && args.content) === 'string' ? args.content : String((args && args.content) || '');
   try {
-    const abs = safePath(filepath);
-    if (abs === path.resolve(WORKSPACE_ROOT)) return { ok: false, error: 'Cannot write to the workspace root' };
+    const abs = safePath(filepath, root);
+    if (abs === path.resolve(root)) return { ok: false, error: 'Cannot write to the workspace root' };
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
     const stat = fs.statSync(abs);
@@ -215,14 +335,15 @@ function toolWriteFile(args) {
   }
 }
 
-function toolEditFile(args) {
+function toolEditFile(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const filepath = String((args && args.filepath) || '').trim();
   const search = (args && args.search !== undefined) ? String(args.search) : '';
   const replace = (args && args.replace !== undefined) ? String(args.replace) : '';
   if (!filepath) return { ok: false, error: 'filepath is required' };
   if (!search) return { ok: false, error: 'search string is required' };
   try {
-    const abs = safePath(filepath);
+    const abs = safePath(filepath, root);
     if (!fs.existsSync(abs)) return { ok: false, error: 'File not found: ' + filepath };
     const original = fs.readFileSync(abs, 'utf8');
     const occurrences = original.split(search).length - 1;
@@ -258,11 +379,12 @@ function toolEditFile(args) {
   }
 }
 
-function toolReadFile(args) {
+function toolReadFile(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const filepath = String((args && args.filepath) || '').trim();
   if (!filepath) return { ok: false, error: 'filepath is required' };
   try {
-    const abs = safePath(filepath);
+    const abs = safePath(filepath, root);
     if (!fs.existsSync(abs)) return { ok: false, error: 'File not found: ' + filepath };
     const stat = fs.statSync(abs);
     if (stat.isDirectory()) {
@@ -301,11 +423,12 @@ function toolReadFile(args) {
   }
 }
 
-function toolListDirectory(args) {
+function toolListDirectory(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const dirpath = String((args && args.dirpath) || '.').trim() || '.';
   const recursive = Boolean(args && args.recursive);
   try {
-    const abs = safePath(dirpath);
+    const abs = safePath(dirpath, root);
     if (!fs.existsSync(abs)) return { ok: false, error: 'Directory not found: ' + dirpath };
     const stat = fs.statSync(abs);
     if (!stat.isDirectory()) {
@@ -323,19 +446,20 @@ function toolListDirectory(args) {
   }
 }
 
-function toolDeletePath(args) {
+function toolDeletePath(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
   const targetPath = String((args && (args.targetPath !== undefined ? args.targetPath : args.filepath)) || '').trim();
   if (!targetPath) return { ok: false, error: 'targetPath is required' };
   try {
-    const abs = safePath(targetPath);
-    if (abs === path.resolve(WORKSPACE_ROOT)) {
+    const abs = safePath(targetPath, root);
+    if (abs === path.resolve(root)) {
       return { ok: false, error: 'Refusing to delete the workspace root directory' };
     }
     if (!fs.existsSync(abs)) return { ok: false, error: 'Path not found: ' + targetPath };
     const stat = fs.statSync(abs);
     const type = stat.isDirectory() ? 'dir' : 'file';
-    fs.rmSync(abs, { recursive: true, force: true });
-    return { ok: true, targetPath: toRelative(abs), type, message: 'Deleted successfully' };
+    guardedDelete(abs, root);
+    return { ok: true, targetPath: toRelativeAt(abs, root), type, message: 'Deleted successfully' };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
@@ -631,7 +755,7 @@ function buildStepDetail(toolName, args, result, status, resultPreview) {
     return {
       kind: 'command',
       command: result.command || args.command || '',
-      cwd: result.cwd || WORKSPACE_ROOT,
+      cwd: result.cwd || workspace.root,
       exitCode: result.exitCode != null ? result.exitCode : null,
       stdout: result.stdout || '',
       stderr: result.stderr || ''
@@ -691,11 +815,20 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'messages array is required' });
   }
 
+  let workspace;
+  try {
+    workspace = prepareWorkspace({ mode: config.workspaceMode, workspaceRoot: config.workspaceRoot });
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ ok: false, error: errorMessage(err) });
+  }
+  const toolCtx = { root: workspace.root };
+
   sseHeaders(res);
   const sse = createSseWriter(res);
 
   const client = new OpenAI({ apiKey: apiKey, baseURL: baseURL, dangerouslyAllowBrowser: false });
-  const conversation = [{ role: 'system', content: systemPrompt }];
+  const workspaceNote = '\n\nWorking directory for this conversation: ' + workspace.root + ' (' + (workspace.relative || 'workspace root / thư mục gốc') + '). All relative paths you pass to tools are resolved inside that directory.';
+  const conversation = [{ role: 'system', content: systemPrompt + workspaceNote }];
   for (const m of messagesIn) {
     if (!m || !m.role) continue;
     if (m.role !== 'user' && m.role !== 'assistant') continue;
@@ -709,7 +842,15 @@ app.post('/api/chat', async (req, res) => {
   const presentedFiles = new Set();
   let stepCount = 0;
 
-  sse.send('start', { model: model, workspaceRoot: WORKSPACE_ROOT, maxSteps: maxSteps });
+  sse.send('start', {
+    model: model,
+    workspaceRoot: workspace.relative || '.',
+    workspaceRootAbsolute: workspace.root,
+    workspaceMode: workspace.mode,
+    workspaceLabel: workspace.label,
+    workspaceCreated: workspace.created,
+    maxSteps: maxSteps
+  });
 
   try {
     let finalContent = '';
@@ -779,7 +920,7 @@ app.post('/api/chat', async (req, res) => {
           status = 'error';
         } else {
           try {
-            result = await executor(args);
+            result = await executor(args, toolCtx);
             if (result && result.ok === false) status = 'error';
           } catch (toolErr) {
             result = { ok: false, error: errorMessage(toolErr) };
@@ -827,9 +968,9 @@ app.post('/api/chat', async (req, res) => {
           const candidates = extractArtifactCandidates(toolName, args);
           for (const candidate of candidates) {
             try {
-              const abs = safePath(candidate);
+              const abs = safePath(candidate, workspace.root);
               if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-                const rel = toRelative(abs);
+                const rel = toRelativeAt(abs, workspace.root);
                 const fallback = toolName === 'write_file' && typeof args.content === 'string' ? args.content : '';
                 const artifact = buildArtifact(rel, fallback);
                 artifactsMap.set(rel, artifact);
@@ -913,7 +1054,13 @@ app.post('/api/terminal', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'command is required' });
   }
   const started = Date.now();
-  const result = await toolExecuteCommand({ command: command, timeoutMs: timeoutMs });
+  let terminalRoot;
+  try {
+    terminalRoot = resolveWorkspaceRoot(body.workspaceRoot || req.query.ws || '');
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ ok: false, error: errorMessage(err) });
+  }
+  const result = await toolExecuteCommand({ command: command, timeoutMs: timeoutMs }, { root: terminalRoot });
   return res.json({
     ok: result.ok,
     command: command,
@@ -925,13 +1072,47 @@ app.post('/api/terminal', async (req, res) => {
   });
 });
 
+app.get('/api/workspaces', (req, res) => {
+  try {
+    const all = listDirectory(DEFAULT_WORKSPACE_ROOT, false);
+    const dirs = all
+      .filter((entry) => entry.type === 'dir' && !IGNORED_DIRS.has(entry.name) && !entry.name.startsWith('.'))
+      .map((entry) => ({ name: entry.name, path: entry.path }));
+    res.json({ ok: true, root: DEFAULT_WORKSPACE_ROOT, workspaces: dirs, defaultAutoName: 'workspace-' + new Date().toISOString().slice(0, 10) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post('/api/workspaces', (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = normalizeRootPath(body.name || '');
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    if (name.includes('..')) return res.status(400).json({ ok: false, error: 'Tên workspace không hợp lệ' });
+    const abs = assertInsideRoot(DEFAULT_WORKSPACE_ROOT, path.join(DEFAULT_WORKSPACE_ROOT, name));
+    if (fs.existsSync(abs)) {
+      if (!fs.statSync(abs).isDirectory()) {
+        return res.status(409).json({ ok: false, error: 'Đã tồn tại file trùng tên: ' + name });
+      }
+      return res.json({ ok: true, workspace: name, root: abs, existed: true });
+    }
+    fs.mkdirSync(abs, { recursive: true });
+    res.json({ ok: true, workspace: name, root: abs, existed: false });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
 app.get('/api/files', (req, res) => {
   try {
     const recursive = req.query.recursive === '1' || req.query.recursive === 'true';
-    const entries = listDirectory(WORKSPACE_ROOT, recursive);
+    const root = resolveWorkspaceRoot(req.query.ws || '');
+    const entries = listDirectory(root, recursive);
     res.json({
       ok: true,
-      root: WORKSPACE_ROOT,
+      root: root,
+      workspaceRoot: toRelativeAt(root, DEFAULT_WORKSPACE_ROOT) || '.',
       count: entries.length,
       entries: entries,
       tree: buildTree(entries)
@@ -976,14 +1157,16 @@ const TEXT_EXTENSIONS = new Set([
 
 app.get('/api/file', (req, res) => {
   try {
+    const root = resolveWorkspaceRoot(req.query.ws || '');
+    const wsQuery = req.query.ws ? '&ws=' + encodeURIComponent(String(req.query.ws)) : '';
     const relPath = String(req.query.path || '').trim();
     if (!relPath) return res.status(400).json({ ok: false, error: 'path is required' });
-    const abs = safePath(relPath);
+    const abs = safePath(relPath, root);
     if (!fs.existsSync(abs)) return res.status(404).json({ ok: false, error: 'File not found' });
     const stat = fs.statSync(abs);
     if (stat.isDirectory()) {
       const entries = listDirectory(abs, false);
-      return res.json({ ok: true, filepath: toRelative(abs), isDirectory: true, entries: entries });
+      return res.json({ ok: true, filepath: toRelativeAt(abs, root), isDirectory: true, entries: entries, workspaceRoot: toRelativeAt(root, DEFAULT_WORKSPACE_ROOT) || '.' });
     }
     if (req.query.download === '1' || req.query.download === 'true') {
       res.setHeader('Content-Type', 'application/octet-stream');
@@ -998,7 +1181,8 @@ app.get('/api/file', (req, res) => {
     }
     const statInfo = {
       ok: true,
-      filepath: toRelative(abs),
+      filepath: toRelativeAt(abs, root),
+      workspaceRoot: toRelativeAt(root, DEFAULT_WORKSPACE_ROOT) || '.',
       filename: path.basename(abs),
       ext: ext,
       kind: fileKind(abs),
@@ -1022,14 +1206,15 @@ app.get('/api/file', (req, res) => {
 app.post('/api/file', (req, res) => {
   try {
     const body = req.body || {};
+    const root = resolveWorkspaceRoot(body.workspaceRoot || req.query.ws || '');
     const relPath = String(body.path || body.filepath || '').trim();
     if (!relPath) return res.status(400).json({ ok: false, error: 'path is required' });
-    const abs = safePath(relPath);
+    const abs = safePath(relPath, root);
     if (body.type === 'dir' || body.isDirectory === true) {
       fs.mkdirSync(abs, { recursive: true });
-      return res.json({ ok: true, filepath: toRelative(abs), type: 'dir', message: 'Directory created' });
+      return res.json({ ok: true, filepath: toRelativeAt(abs, root), type: 'dir', message: 'Directory created' });
     }
-    if (abs === path.resolve(WORKSPACE_ROOT)) {
+    if (abs === path.resolve(root)) {
       return res.status(400).json({ ok: false, error: 'Cannot write to the workspace root' });
     }
     const content = typeof body.content === 'string' ? body.content : '';
@@ -1038,7 +1223,7 @@ app.post('/api/file', (req, res) => {
     const stat = fs.statSync(abs);
     return res.json({
       ok: true,
-      filepath: toRelative(abs),
+      filepath: toRelativeAt(abs, root),
       filename: path.basename(abs),
       kind: fileKind(abs),
       size: stat.size,
@@ -1054,7 +1239,8 @@ app.delete('/api/file', (req, res) => {
   try {
     const relPath = String(req.query.path || (req.body && req.body.path) || '').trim();
     if (!relPath) return res.status(400).json({ ok: false, error: 'path is required' });
-    const result = toolDeletePath({ targetPath: relPath });
+    const deleteRoot = resolveWorkspaceRoot(req.query.ws || (req.body && req.body.workspaceRoot) || '');
+    const result = toolDeletePath({ targetPath: relPath }, { root: deleteRoot });
     if (!result.ok) return res.status(400).json(result);
     return res.json(result);
   } catch (err) {
@@ -1065,6 +1251,7 @@ app.delete('/api/file', (req, res) => {
 app.post('/api/upload', (req, res) => {
   try {
     const body = req.body || {};
+    const uploadRoot = resolveWorkspaceRoot(body.workspaceRoot || req.query.ws || '');
     const files = Array.isArray(body.files) ? body.files : (body.filepath ? [{ filepath: body.filepath, base64Data: body.base64Data }] : []);
     if (files.length === 0) return res.status(400).json({ ok: false, error: 'files array is required' });
     if (files.length > 200) return res.status(400).json({ ok: false, error: 'Too many files in one request' });
@@ -1082,12 +1269,12 @@ app.post('/api/upload', (req, res) => {
         continue;
       }
       try {
-        const abs = safePath(filepath);
+        const abs = safePath(filepath, uploadRoot);
         const cleaned = base64Data.replace(/^data:[^;]+;base64,/, '');
         const buffer = Buffer.from(cleaned, 'base64');
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         fs.writeFileSync(abs, buffer);
-        saved.push({ filepath: toRelative(abs), size: buffer.length, sizeHuman: formatSize(buffer.length) });
+        saved.push({ filepath: toRelativeAt(abs, uploadRoot), size: buffer.length, sizeHuman: formatSize(buffer.length) });
       } catch (err) {
         failed.push({ filepath: filepath, error: errorMessage(err) });
       }
@@ -1098,10 +1285,11 @@ app.post('/api/upload', (req, res) => {
   }
 });
 
-function getDiskUsage() {
-  const usage = { filesystem: '-', size: '-', used: '-', avail: '-', usePercent: '-', mounted: WORKSPACE_ROOT };
+function getDiskUsage(targetPath) {
+  const target = targetPath || DEFAULT_WORKSPACE_ROOT;
+  const usage = { filesystem: '-', size: '-', used: '-', avail: '-', usePercent: '-', mounted: target };
   try {
-    const out = execSync('df -h ' + JSON.stringify(WORKSPACE_ROOT), { encoding: 'utf8', timeout: 8000, shell: '/bin/bash' });
+    const out = execSync('df -h ' + JSON.stringify(target), { encoding: 'utf8', timeout: 8000, shell: '/bin/bash' });
     const lines = out.trim().split('\n');
     if (lines.length >= 2) {
       const parts = lines[1].trim().split(/\s+/);
@@ -1161,7 +1349,7 @@ app.get('/api/stats', (req, res) => {
         osHuman: humanDuration(Math.floor(os.uptime()))
       },
       disk: disk,
-      workspaceRoot: WORKSPACE_ROOT
+      workspaceRoot: DEFAULT_WORKSPACE_ROOT
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: errorMessage(err) });
@@ -1483,6 +1671,40 @@ const INDEX_HTML = `<!DOCTYPE html>
   .composer textarea::placeholder { color: #77756f; }
   .composer-actions { display: flex; align-items: center; justify-content: space-between; margin-top: 2px; }
   .composer-left { display: flex; align-items: center; gap: 2px; }
+  .ws-chip {
+    display: inline-flex; align-items: center; gap: 5px; max-width: 210px;
+    border: 1px solid var(--border-outer); border-radius: 999px; padding: 3px 9px 3px 7px;
+    font-size: 10.5px; color: var(--text-row); background: transparent;
+    transition: all 0.28s var(--ease);
+  }
+  .ws-chip:hover { border-color: #3E3E3A; color: var(--text-main); }
+  .ws-chip.is-root { color: var(--accent); border-color: rgba(217, 119, 87, 0.45); }
+  .ws-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: 'JetBrains Mono', monospace; }
+  .ws-options { display: flex; flex-direction: column; gap: 7px; }
+  .ws-option {
+    display: flex; flex-direction: column; gap: 3px; text-align: left;
+    border: 1px solid var(--border-outer); border-radius: 8px; padding: 9px 11px;
+    background: #1d1d1b; transition: all 0.28s var(--ease);
+  }
+  .ws-option:hover { border-color: #3E3E3A; }
+  .ws-option.is-active { border-color: var(--accent); background: #241d19; }
+  .ws-option-title { font-size: 12.5px; color: var(--text-main); }
+  .ws-option.is-active .ws-option-title { color: var(--accent); }
+  .ws-option-desc { font-size: 11px; color: var(--text-summary); line-height: 1.45; }
+  .ws-picker { margin-top: 12px; }
+  .ws-picker-actions { display: flex; gap: 7px; align-items: center; }
+  .ws-select {
+    flex: 1; min-width: 0; background: var(--bg-input); border: 1px solid var(--border-outer);
+    border-radius: 7px; color: var(--text-main); font-size: 11.5px; padding: 6px 8px; outline: none;
+    font-family: 'JetBrains Mono', monospace; transition: border-color 0.28s var(--ease);
+  }
+  .ws-select:focus { border-color: #4a4a44; }
+  .ws-hint { font-size: 10.5px; color: var(--text-summary); margin-top: 6px; min-height: 14px; }
+  .ws-hint.is-error { color: #c97564; }
+  .ws-warning {
+    margin-top: 12px; border: 1px solid #4a2f2a; background: #241a18; color: #d99b8b;
+    border-radius: 8px; padding: 9px 11px; font-size: 11px; line-height: 1.55;
+  }
   .send-btn {
     width: 30px; height: 30px; border-radius: 7px; background: var(--accent); color: #fff;
     display: inline-flex; align-items: center; justify-content: center;
@@ -1697,6 +1919,10 @@ const INDEX_HTML = `<!DOCTYPE html>
               <input id="fileInput" type="file" multiple class="is-hidden" />
             </div>
             <div class="composer-left">
+              <button id="wsBtn" class="ws-chip" type="button" title="Chọn workspace cho hội thoại">
+                <svg class="chevron" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M3.5 10.5 L8 6 L12.5 10.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                <span id="wsLabel" class="ws-chip-label">Auto workspace</span>
+              </button>
               <button id="stopBtn" class="icon-btn is-hidden" title="Dừng" aria-label="Dừng yêu cầu">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.2" fill="currentColor"></rect></svg>
               </button>
@@ -1774,6 +2000,49 @@ const INDEX_HTML = `<!DOCTYPE html>
       </div>
     </div>
   </aside>
+</div>
+
+<div id="wsModal" class="modal is-hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span class="modal-title">Workspace cho cuộc trò chuyện</span>
+      <button id="wsClose" class="icon-btn" type="button" aria-label="Đóng">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path></svg>
+      </button>
+    </div>
+    <div class="ws-options">
+      <button class="ws-option" type="button" data-mode="auto">
+        <span class="ws-option-title">Auto workspace</span>
+        <span class="ws-option-desc">Tự tạo thư mục riêng cho phiên này rồi làm việc bên trong. An toàn nhất.</span>
+      </button>
+      <button class="ws-option" type="button" data-mode="picker">
+        <span class="ws-option-title">Chọn workspace hoặc tự tạo</span>
+        <span class="ws-option-desc">Chỉ định thư mục con hiện có hoặc tạo mới ngay tại đây.</span>
+      </button>
+      <button class="ws-option" type="button" data-mode="root">
+        <span class="ws-option-title">Không workspace (thư mục gốc)</span>
+        <span class="ws-option-desc">Agent đọc/ghi trực tiếp ngay trong thư mục gốc của ứng dụng.</span>
+      </button>
+    </div>
+    <div id="wsPickerBox" class="ws-picker is-hidden">
+      <label class="field">
+        <span class="field-label">Tên hoặc đường dẫn thư mục</span>
+        <input id="wsNameInput" type="text" placeholder="my-project" autocomplete="off" />
+      </label>
+      <div class="ws-picker-actions">
+        <select id="wsSelect" class="ws-select"></select>
+        <button id="wsCreateBtn" class="btn-small" type="button">Tạo thư mục</button>
+      </div>
+      <div id="wsPickerHint" class="ws-hint"></div>
+    </div>
+    <div id="wsRootWarning" class="ws-warning is-hidden">
+      Cảnh báo: ở chế độ không workspace, agent làm việc trực tiếp trong thư mục gốc / nơi chứa server.js, package.json, node_modules và .env. Thao tác sai có thể ghi đè hoặc xóa chính ứng dụng. Các file hệ thống được bảo vệ khỏi lệnh xóa, nhưng hãy sao lưu trước khi dùng.
+    </div>
+    <div class="modal-actions">
+      <button id="wsCancel" class="btn-ghost" type="button">Hủy</button>
+      <button id="wsApply" class="btn-confirm" type="button">Áp dụng</button>
+    </div>
+  </div>
 </div>
 
 <div id="settingsModal" class="modal is-hidden">
@@ -1857,8 +2126,40 @@ const state = {
   attachments: [],
   sending: false,
   abortController: null,
-  serverFiles: []
+  serverFiles: [],
+  workspace: { mode: 'auto', root: '', label: 'Auto workspace', active: '', created: false }
 };
+
+function wsQuery() {
+  const root = state.workspace && state.workspace.active ? state.workspace.active : '';
+  return root && root !== '.' ? 'ws=' + encodeURIComponent(root) : '';
+}
+
+function wsParam(prefix) {
+  const query = wsQuery();
+  if (!query) return '';
+  return (prefix === '?' ? '?' : '&') + query;
+}
+
+function applyWorkspaceBadge() {
+  const chip = el('wsBtn');
+  const label = el('wsLabel');
+  if (!chip || !label) return;
+  const workspace = state.workspace || {};
+  if (workspace.mode === 'root') {
+    label.textContent = 'Không workspace · thư mục gốc';
+    chip.classList.add('is-root');
+    chip.title = 'Agent làm việc trực tiếp trong thư mục gốc của ứng dụng';
+  } else if (workspace.mode === 'picker') {
+    label.textContent = workspace.active || 'Chọn workspace';
+    chip.classList.remove('is-root');
+    chip.title = 'Workspace đang dùng: ' + (workspace.active || '(chưa chọn)');
+  } else {
+    label.textContent = workspace.created ? 'Auto · ' + (workspace.active || 'mới') : 'Auto workspace';
+    chip.classList.remove('is-root');
+    chip.title = workspace.created ? 'Đã tạo workspace: ' + workspace.active : 'Tự tạo workspace mới cho phiên này';
+  }
+}
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -2402,6 +2703,13 @@ function handleSseEvent(turn, event, data) {
   if (!assistant) return;
   if (event === 'start') {
     assistant.model = data.model;
+    if (data.workspaceRoot) {
+      state.workspace.active = data.workspaceRoot;
+      state.workspace.created = Boolean(data.workspaceCreated);
+      state.workspace.activeAbsolute = data.workspaceRootAbsolute || '';
+      applyWorkspaceBadge();
+      refreshFileTree();
+    }
     return;
   }
   if (event === 'step_start') {
@@ -2964,7 +3272,9 @@ async function sendMessage() {
         model: state.settings.model,
         systemPrompt: state.settings.systemPrompt,
         maxSteps: state.settings.maxSteps,
-        password: state.settings.password
+        password: state.settings.password,
+        workspaceMode: state.workspace.mode,
+        workspaceRoot: state.workspace.active || ''
       }
     }, turn);
   } catch (err) {
@@ -3018,13 +3328,13 @@ async function uploadFiles(fileList) {
     const resp = await fetch('/api/upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ files: payload })
+      body: JSON.stringify({ files: payload, workspaceRoot: state.workspace.active || '' })
     });
     const data = await resp.json();
     const savedNames = (data.saved || []).map((item) => item.filepath);
     for (const name of savedNames) {
       try {
-        const r = await fetch('/api/file?path=' + encodeURIComponent(name));
+        const r = await fetch('/api/file?path=' + encodeURIComponent(name) + wsParam('&'));
         const info = await r.json();
         if (info.ok && !info.isDirectory) state.attachments.push({ filepath: name, content: info.content || '' });
       } catch (err) {
@@ -3041,7 +3351,7 @@ async function uploadFiles(fileList) {
 
 async function refreshFileTree() {
   try {
-    const resp = await fetch('/api/files?recursive=1');
+    const resp = await fetch('/api/files?recursive=1' + wsParam('&'));
     const data = await resp.json();
     const container = el('fileTree');
     container.innerHTML = '';
@@ -3074,7 +3384,7 @@ async function refreshFileTree() {
           download.title = 'Tải file';
           download.addEventListener('click', (ev) => {
             ev.stopPropagation();
-            window.open('/api/file?download=1&path=' + encodeURIComponent(child.path), '_blank');
+            window.open('/api/file?download=1&path=' + encodeURIComponent(child.path) + wsParam('&'), '_blank');
           });
           actions.appendChild(download);
         }
@@ -3086,7 +3396,7 @@ async function refreshFileTree() {
         remove.addEventListener('click', async (ev) => {
           ev.stopPropagation();
           if (!window.confirm('Xóa ' + child.path + '?')) return;
-          await fetch('/api/file?path=' + encodeURIComponent(child.path), { method: 'DELETE' });
+          await fetch('/api/file?path=' + encodeURIComponent(child.path) + wsParam('&'), { method: 'DELETE' });
           refreshFileTree();
         });
         actions.appendChild(remove);
@@ -3156,7 +3466,7 @@ function renderPreviewFor(filepath, ext, content) {
   const lower = String(ext || '').toLowerCase();
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico'].includes(lower)) {
     showPreviewIframe(true);
-    el('previewFrame').srcdoc = '<html><body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#191918"><img src="/api/file?raw=1&amp;path=' + encodeURIComponent(filepath) + '&amp;t=' + Date.now() + '" style="max-width:100%;max-height:100%" /></body></html>';
+    el('previewFrame').srcdoc = '<html><body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#191918"><img src="/api/file?raw=1&amp;path=' + encodeURIComponent(filepath) + '&amp;t=' + Date.now() + wsParam('&amp;').replace(/&/g, '&amp;') + '" style="max-width:100%;max-height:100%" /></body></html>';
     return;
   }
   if (lower === 'md') {
@@ -3179,7 +3489,7 @@ function renderPreviewFor(filepath, ext, content) {
 
 async function loadFileIntoPanels(filepath) {
   try {
-    const resp = await fetch('/api/file?path=' + encodeURIComponent(filepath));
+    const resp = await fetch('/api/file?path=' + encodeURIComponent(filepath) + wsParam('&'));
     const data = await resp.json();
     if (!data.ok || data.isDirectory) {
       showPreviewIframe(false);
@@ -3242,7 +3552,7 @@ async function saveCurrentFile() {
     const resp = await fetch('/api/file', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: state.currentFile, content: content })
+      body: JSON.stringify({ path: state.currentFile, content: content, workspaceRoot: state.workspace.active || '' })
     });
     const data = await resp.json();
     if (!data.ok) throw new Error(data.error || 'Save failed');
@@ -3274,7 +3584,7 @@ async function runTerminal(command) {
     const resp = await fetch('/api/terminal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: command })
+      body: JSON.stringify({ command: command, workspaceRoot: state.workspace.active || '' })
     });
     const data = await resp.json();
     if (data.stdout) {
@@ -3391,7 +3701,7 @@ async function renderServerFileList(filter) {
     row.appendChild(size);
     row.addEventListener('click', async () => {
       try {
-        const resp = await fetch('/api/file?path=' + encodeURIComponent(item.path));
+        const resp = await fetch('/api/file?path=' + encodeURIComponent(item.path) + wsParam('&'));
         const data = await resp.json();
         if (data.ok && !data.isDirectory) {
           state.attachments.push({ filepath: item.path, content: data.content || '' });
@@ -3472,6 +3782,20 @@ function bindEvents() {
     createChat();
     el('input').focus();
   });
+  el('wsBtn').addEventListener('click', openWorkspaceModal);
+  el('wsClose').addEventListener('click', closeWorkspaceModal);
+  el('wsCancel').addEventListener('click', closeWorkspaceModal);
+  el('wsApply').addEventListener('click', applyWorkspaceModal);
+  el('wsCreateBtn').addEventListener('click', createWorkspaceFromModal);
+  el('wsSelect').addEventListener('change', (ev) => {
+    if (ev.target.value) el('wsNameInput').value = ev.target.value;
+  });
+  document.querySelectorAll('.ws-option').forEach((btn) => {
+    btn.addEventListener('click', () => selectWorkspaceMode(btn.dataset.mode));
+  });
+  el('wsModal').addEventListener('click', (ev) => {
+    if (ev.target.id === 'wsModal') closeWorkspaceModal();
+  });
   el('settingsBtn').addEventListener('click', openSettings);
   el('closeSettings').addEventListener('click', closeSettingsModal);
   el('cancelSettings').addEventListener('click', closeSettingsModal);
@@ -3522,7 +3846,7 @@ function bindEvents() {
     if (state.currentFile) loadFileIntoPanels(state.currentFile);
   });
   el('previewOpen').addEventListener('click', () => {
-    if (state.currentFile) window.open('/api/file?raw=1&path=' + encodeURIComponent(state.currentFile), '_blank');
+    if (state.currentFile) window.open('/api/file?raw=1&path=' + encodeURIComponent(state.currentFile) + wsParam('&'), '_blank');
   });
   el('codeSave').addEventListener('click', saveCurrentFile);
   el('codeCopy').addEventListener('click', () => {
@@ -3533,7 +3857,7 @@ function bindEvents() {
   });
   el('codeDownload').addEventListener('click', () => {
     if (!state.currentFile) return;
-    window.open('/api/file?download=1&path=' + encodeURIComponent(state.currentFile), '_blank');
+    window.open('/api/file?download=1&path=' + encodeURIComponent(state.currentFile) + wsParam('&'), '_blank');
   });
   el('codeEditor').addEventListener('input', () => {
     state.codeDirty = true;
@@ -3559,7 +3883,7 @@ function bindEvents() {
     const resp = await fetch('/api/file', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: target, content: '' })
+      body: JSON.stringify({ path: target, content: '', workspaceRoot: state.workspace.active || '' })
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -3575,7 +3899,7 @@ function bindEvents() {
     const resp = await fetch('/api/file', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: target, type: 'dir' })
+      body: JSON.stringify({ path: target, type: 'dir', workspaceRoot: state.workspace.active || '' })
     });
     const data = await resp.json();
     if (!data.ok) {
@@ -3620,6 +3944,121 @@ function bindEvents() {
   });
 }
 
+function openWorkspaceModal() {
+  const modal = el('wsModal');
+  const current = state.workspace || { mode: 'auto' };
+  modal.classList.remove('is-hidden');
+  selectWorkspaceMode(current.mode || 'auto');
+  el('wsNameInput').value = current.active && current.active !== '.' ? current.active : '';
+  loadWorkspaceOptions();
+}
+
+function closeWorkspaceModal() {
+  el('wsModal').classList.add('is-hidden');
+}
+
+function selectWorkspaceMode(mode) {
+  const normalized = ['auto', 'picker', 'root'].includes(mode) ? mode : 'auto';
+  document.querySelectorAll('.ws-option').forEach((btn) => {
+    btn.classList.toggle('is-active', btn.dataset.mode === normalized);
+  });
+  const picker = el('wsPickerBox');
+  const warning = el('wsRootWarning');
+  if (normalized === 'picker') picker.classList.remove('is-hidden');
+  else picker.classList.add('is-hidden');
+  if (normalized === 'root') warning.classList.remove('is-hidden');
+  else warning.classList.add('is-hidden');
+  el('wsModal').dataset.mode = normalized;
+  const hint = el('wsPickerHint');
+  hint.classList.remove('is-error');
+  if (normalized === 'auto') hint.textContent = 'Thư mục mới sẽ được tạo tự động (workspace-YYYY-MM-DD) nếu chưa có.';
+  else if (normalized === 'picker') hint.textContent = 'Chọn một thư mục bên dưới hoặc gõ tên mới rồi bấm Tạo thư mục.';
+  else hint.textContent = '';
+}
+
+async function loadWorkspaceOptions() {
+  const select = el('wsSelect');
+  select.innerHTML = '';
+  const rootOption = document.createElement('option');
+  rootOption.value = '';
+  rootOption.textContent = '(thư mục gốc)';
+  select.appendChild(rootOption);
+  try {
+    const resp = await fetch('/api/workspaces');
+    const data = await resp.json();
+    if (data.ok && Array.isArray(data.workspaces)) {
+      state.serverFiles = state.serverFiles || [];
+      data.workspaces.forEach((workspace) => {
+        const option = document.createElement('option');
+        option.value = workspace.path;
+        option.textContent = workspace.path;
+        select.appendChild(option);
+      });
+      if (!select.value && state.workspace.active) select.value = state.workspace.active;
+    }
+  } catch (err) {
+    /* workspace list is best effort */
+  }
+}
+
+function applyWorkspaceModal() {
+  const modal = el('wsModal');
+  const mode = modal.dataset.mode || 'auto';
+  const typed = el('wsNameInput').value.trim();
+  if (mode === 'picker' && !typed) {
+    const hint = el('wsPickerHint');
+    hint.textContent = 'Hãy chọn hoặc nhập một thư mục cho chế độ này, hoặc chuyển sang Auto workspace.';
+    hint.classList.add('is-error');
+    return;
+  }
+  if (mode === 'root') {
+    const ok = window.confirm('Chuyển sang chế độ KHÔNG WORKSPACE? Agent sẽ đọc/ghi trực tiếp trong thư mục gốc của ứng dụng (server.js, package.json, .env). Hãy sao lưu trước khi tiếp tục.');
+    if (!ok) return;
+  }
+  state.workspace = {
+    mode: mode,
+    root: mode === 'root' ? '' : typed,
+    label: '',
+    active: mode === 'root' ? '' : typed,
+    created: false
+  };
+  applyWorkspaceBadge();
+  closeWorkspaceModal();
+  refreshFileTree();
+  if (mode !== 'root') {
+    setTimeout(() => {
+      if (!state.workspace.created) applyWorkspaceBadge();
+    }, 0);
+  }
+}
+
+async function createWorkspaceFromModal() {
+  const name = el('wsNameInput').value.trim();
+  const hint = el('wsPickerHint');
+  hint.classList.remove('is-error');
+  if (!name) {
+    hint.textContent = 'Nhập tên thư mục trước khi tạo.';
+    hint.classList.add('is-error');
+    return;
+  }
+  try {
+    const resp = await fetch('/api/workspaces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Không tạo được thư mục');
+    hint.textContent = data.existed ? 'Thư mục đã có sẵn, dùng lại: ' + data.workspace : 'Đã tạo: ' + data.workspace;
+    el('wsNameInput').value = data.workspace;
+    await loadWorkspaceOptions();
+    el('wsSelect').value = data.workspace;
+  } catch (err) {
+    hint.textContent = err.message;
+    hint.classList.add('is-error');
+  }
+}
+
 async function init() {
   migrateLegacyStorage();
   loadSettings();
@@ -3640,6 +4079,7 @@ async function init() {
     el('messages').classList.add('is-hidden');
   }
   setModelBadge();
+  applyWorkspaceBadge();
   bindEvents();
   window.__claudexReady = true;
   fetchStats();
@@ -3689,7 +4129,7 @@ app.listen(PORT, HOST, () => {
   console.log('==============================================');
   console.log(' Claudex Agentic Workspace is running');
   console.log(' URL         : http://' + HOST + ':' + PORT);
-  console.log(' Workspace   : ' + WORKSPACE_ROOT);
+  console.log(' Workspace   : ' + DEFAULT_WORKSPACE_ROOT);
   console.log(' Node        : ' + process.version);
   console.log(' RSS         : ' + formatSize(mem.rss));
   console.log(' Chat API    : POST /api/chat (SSE streaming)');
