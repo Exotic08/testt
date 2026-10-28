@@ -1,0 +1,19 @@
+{
+  "name": "all-in-one-claudex-agent-workspace",
+  "version": "1.0.0",
+  "description": "All-in-One Claudex.ai Agent Workspace & Docker Sandbox running on Node.js",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "summarize": "node scripts/summarize-json.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "openai": "^4.52.0",
+    "dotenv": "^16.4.5"
+  }
+}
