@@ -2325,7 +2325,21 @@ const INDEX_HTML = `<!DOCTYPE html>
     max-height: 0; opacity: 0;
     transition: max-height 0.28s var(--ease), opacity 0.28s var(--ease), margin 0.28s var(--ease);
   }
-  .action-stack.is-open { max-height: 2600px; opacity: 1; }
+  .action-stack.is-open { max-height: 3200px; opacity: 1; }
+  .action-more {
+    width: 100%; text-align: left; padding: 7px 14px; font-size: 11.5px;
+    color: var(--text-summary); border-top: 1px solid var(--border-row);
+    transition: color 0.28s var(--ease);
+  }
+  .action-more:hover { color: var(--text-main); }
+  .action-more.is-hidden { display: none; }
+  .action-pending {
+    display: flex; align-items: center; padding: 7px 14px; font-size: 12px;
+    color: var(--text-row); border-top: 1px solid var(--border-row);
+  }
+  .action-pending.is-hidden { display: none; }
+  .action-pending-text { font-family: 'Inter', sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .action-children .action-row:last-child { border-bottom: none; }
   .action-stack-inner { display: flex; flex-direction: column; }
   .action-row { border-bottom: 1px solid var(--border-row); }
   .action-row:last-child { border-bottom: none; }
@@ -3163,28 +3177,60 @@ const LABELS = {
   presented: 'Presented file'
 };
 
+function stepCategory(entry) {
+  const name = entry && entry.name;
+  if (name === 'write_file' || name === 'write_multiple_files') return 'create';
+  if (name === 'edit_file' || name === 'replace_in_file') return 'edit';
+  if (name === 'execute_command' || name === 'find_files') return 'command';
+  if (name === 'read_file' || name === 'read_multiple_files') return 'read';
+  if (name === 'list_directory' || name === 'list_directory_tree' || name === 'glob_files' || name === 'grep_search') return 'list';
+  if (name === 'delete_path') return 'remove';
+  if (name === 'move_path' || name === 'copy_path') return 'move';
+  if (name === 'present') return 'present';
+  if (name === 'read_skill' || name === 'list_skills') return 'skill';
+  return 'other';
+}
+
+const CATEGORY_LABELS = {
+  create: ['Tạo file', 'tạo %s file'],
+  edit: ['Sửa file', 'sửa %s file'],
+  command: ['Chạy lệnh', 'chạy %s lệnh'],
+  read: ['Đọc file', 'đọc %s file'],
+  list: ['Duyệt thư mục', 'duyệt %s thư mục'],
+  remove: ['Xóa', 'xóa %s mục'],
+  move: ['Di chuyển file', 'di chuyển %s mục'],
+  present: ['Chia sẻ file', 'chia sẻ %s file'],
+  skill: ['Dùng skill', 'dùng %s skill'],
+  other: ['Dùng công cụ', 'dùng %s công cụ']
+};
+
+const CATEGORY_ORDER = ['create', 'edit', 'command', 'read', 'list', 'move', 'remove', 'present', 'skill', 'other'];
+
 function buildSummaryText(entries, running) {
-  if (running) return 'Executing actions...';
-  if (!entries.length) return 'Executed actions';
-  const counts = { create: 0, edit: 0, command: 0, read: 0, list: 0, remove: 0, other: 0 };
+  if (running) return 'Đang thực hiện...';
+  if (!entries || !entries.length) return 'Không có hành động';
+  const counts = {};
+  const files = [];
   for (const entry of entries) {
-    if (entry.name === 'write_file') counts.create += 1;
-    else if (entry.name === 'edit_file') counts.edit += 1;
-    else if (entry.name === 'execute_command') counts.command += 1;
-    else if (entry.name === 'read_file') counts.read += 1;
-    else if (entry.name === 'list_directory') counts.list += 1;
-    else if (entry.name === 'delete_path') counts.remove += 1;
-    else counts.other += 1;
+    const category = stepCategory(entry);
+    counts[category] = (counts[category] || 0) + 1;
+    if ((category === 'create' || category === 'edit' || category === 'present') && entry.file && files.length < 3 && !files.includes(entry.file)) {
+      files.push(entry.file);
+    }
   }
   const parts = [];
-  if (counts.create) parts.push('Created ' + (counts.create > 1 ? counts.create + ' files' : 'a file'));
-  if (counts.edit) parts.push('edited ' + (counts.edit > 1 ? counts.edit + ' files' : 'a file'));
-  if (counts.command) parts.push('ran ' + (counts.command > 1 ? counts.command + ' commands' : 'a command'));
-  if (counts.read) parts.push('read ' + (counts.read > 1 ? counts.read + ' files' : 'a file'));
-  if (counts.list) parts.push('inspected ' + (counts.list > 1 ? counts.list + ' directories' : 'the workspace'));
-  if (counts.remove) parts.push('deleted ' + (counts.remove > 1 ? counts.remove + ' paths' : 'a path'));
-  if (counts.other && !parts.length) parts.push('used ' + (counts.other > 1 ? counts.other + ' tools' : 'a tool'));
-  return capitalizeFirst(parts.join(', '));
+  CATEGORY_ORDER.forEach((category) => {
+    const count = counts[category];
+    if (!count) return;
+    const labels = CATEGORY_LABELS[category] || CATEGORY_LABELS.other;
+    parts.push(count === 1 ? labels[0] : labels[1].replace('%s', String(count)));
+  });
+  let text = capitalizeFirst(parts.join(', '));
+  if (files.length) {
+    const suffix = files.length < 3 ? files.join(', ') : files.slice(0, 2).join(', ') + '…';
+    text += ' · ' + suffix;
+  }
+  return text;
 }
 
 function capitalizeFirst(text) {
@@ -3245,10 +3291,103 @@ function buildDetailHtml(step) {
   return '<pre class="detail-code' + (detail.error ? ' is-error' : '') + '">' + escapeHtml(detail.resultPreview || JSON.stringify(step.args || {}, null, 2)) + '</pre>';
 }
 
+function syncStepRowDetail(row, step) {
+  const detailInner = row.querySelector('.action-row-detail-inner');
+  if (!detailInner) return;
+  const marker = (step.status || '') + '|' + (step.durationMs || 0) + '|' + (step.open ? '1' : '0');
+  if (detailInner.dataset.marker === marker) return;
+  detailInner.dataset.marker = marker;
+  if (step.status === 'running') {
+    detailInner.innerHTML = '<pre class="detail-code">' + escapeHtml(JSON.stringify(step.args || {}, null, 2)) + '</pre>';
+  } else {
+    detailInner.innerHTML = buildDetailHtml(step);
+  }
+}
+
+function applyStepRowState(row, step) {
+  row.dataset.stepId = step.id;
+  row.classList.toggle('is-running', step.status === 'running');
+  row.classList.toggle('is-error', step.status === 'error');
+  row.classList.toggle('is-open', Boolean(step.open));
+
+  const textWrap = row.querySelector('.action-row-text');
+  if (textWrap) {
+    const lead = textWrap.querySelector('.row-lead');
+    if (lead) lead.textContent = stepRowLabel(step);
+    const fileLink = textWrap.querySelector('.row-file');
+    const shimmerEl = textWrap.querySelector('.shimmer');
+    const summaryEl = textWrap.querySelector('.row-summary');
+    if (step.file) {
+      let target = fileLink;
+      if (!target) {
+        target = document.createElement('span');
+        target.className = 'row-file';
+        target.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const current = row.__step || step;
+          if (current.fileIsCommand) return;
+          openFileInRight(current.file, previewModeFor(current.file, String(current.file).split('.').pop()));
+        });
+        textWrap.appendChild(target);
+      }
+      if (target.textContent !== step.file) target.textContent = step.file;
+      target.classList.toggle('row-command', Boolean(step.fileIsCommand));
+      if (shimmerEl) shimmerEl.remove();
+      if (summaryEl) summaryEl.remove();
+    } else if (step.status === 'running') {
+      if (fileLink) fileLink.remove();
+      if (summaryEl) summaryEl.remove();
+      if (!shimmerEl) {
+        const running = document.createElement('span');
+        running.className = 'shimmer';
+        textWrap.appendChild(running);
+      }
+      const runner = textWrap.querySelector('.shimmer');
+      if (runner) {
+        const label = step.summary || 'Đang thực hiện';
+        if (runner.textContent !== label) runner.textContent = label;
+      }
+    } else {
+      if (fileLink) fileLink.remove();
+      if (shimmerEl) shimmerEl.remove();
+      let summaryNode = summaryEl;
+      if (!summaryNode) {
+        summaryNode = document.createElement('span');
+        summaryNode.className = 'row-summary';
+        textWrap.appendChild(summaryNode);
+      }
+      const label = step.summary || '';
+      if (summaryNode.textContent !== label) summaryNode.textContent = label;
+    }
+  }
+
+  const meta = row.querySelector('.row-meta');
+  if (meta) {
+    let metaText = '';
+    if (step.status === 'running') metaText = 'đang chạy';
+    else if (step.status === 'error') metaText = 'lỗi · ' + formatDuration(step.durationMs);
+    else metaText = formatDuration(step.durationMs);
+    if (meta.textContent !== metaText) meta.textContent = metaText;
+  }
+
+  const arrow = row.querySelector('.row-arrow');
+  if (arrow) {
+    const wanted = chevronSvg(Boolean(step.open));
+    if (arrow.dataset.open !== (step.open ? '1' : '0')) {
+      arrow.dataset.open = step.open ? '1' : '0';
+      arrow.innerHTML = wanted;
+    }
+  }
+
+  syncStepRowDetail(row, step);
+  row.__step = step;
+}
+
 function buildStepRow(step) {
   const row = document.createElement('div');
-  row.className = 'action-row' + (step.status === 'running' ? ' is-running' : '') + (step.status === 'error' ? ' is-error' : '');
+  row.className = 'action-row';
   row.dataset.stepId = step.id;
+  row.__step = step;
 
   const head = document.createElement('button');
   head.type = 'button';
@@ -3306,12 +3445,17 @@ function buildStepRow(step) {
   detail.appendChild(detailInner);
 
   head.addEventListener('click', () => {
-    const open = row.classList.toggle('is-open');
+    const current = row.__step || step;
+    current.open = !current.open;
+    const open = Boolean(current.open);
+    row.classList.toggle('is-open', open);
+    arrow.dataset.open = open ? '1' : '0';
     arrow.innerHTML = chevronSvg(open);
   });
 
   row.appendChild(head);
   row.appendChild(detail);
+  applyStepRowState(row, step);
   return row;
 }
 
@@ -3335,23 +3479,13 @@ function buildTimeline(block) {
   header.appendChild(arrow);
 
   const stack = document.createElement('div');
-  stack.className = 'action-stack' + (block.collapsed === false ? ' is-open' : '');
+  const openInitially = block.collapsed === false || Boolean(running);
+  stack.className = 'action-stack' + (openInitially ? ' is-open' : '');
   const inner = document.createElement('div');
-  inner.className = 'action-stack-inner';
-  if (running && entries.length === 0) {
-    const waiting = document.createElement('div');
-    waiting.className = 'action-row is-running';
-    const waitingHead = document.createElement('div');
-    waitingHead.className = 'action-row-head';
-    const shimmer = document.createElement('span');
-    shimmer.className = 'action-row-text shimmer';
-    shimmer.textContent = 'Đang chuẩn bị hành động';
-    waitingHead.appendChild(shimmer);
-    waiting.appendChild(waitingHead);
-    inner.appendChild(waiting);
-  }
+  inner.className = ACTION_CHILD_CLASS;
   entries.forEach((step) => inner.appendChild(buildStepRow(step)));
   stack.appendChild(inner);
+  applyRowOpenStates(block);
 
   header.addEventListener('click', () => {
     const open = stack.classList.toggle('is-open');
@@ -3471,13 +3605,37 @@ function ensureTurnBody(turn) {
   return body;
 }
 
+function applyRowOpenStates(block) {
+  if (!block || !block.el) return;
+  const openIds = {};
+  const expandedIds = Array.isArray(block.openIds) ? block.openIds : [];
+  expandedIds.forEach((id) => {
+    openIds[id] = true;
+  });
+  block.el.querySelectorAll('.action-row').forEach((row) => {
+    const shouldOpen = Boolean(openIds[row.dataset.stepId] || (row.__step && row.__step.open));
+    row.classList.toggle('is-open', shouldOpen);
+    const arrow = row.querySelector('.row-arrow');
+    if (arrow) {
+      arrow.dataset.open = shouldOpen ? '1' : '0';
+      arrow.innerHTML = chevronSvg(shouldOpen);
+    }
+  });
+}
+
 function getTurnTimeline(turn) {
   if (!turn || !turn.el) return null;
   if (!turn.assistant) return null;
+  const orphan = turn.el.querySelector('.timeline');
   if (!turn.assistant.timeline) {
-    turn.assistant.timeline = { entries: [], running: false, collapsed: true, el: null };
+    turn.assistant.timeline = { entries: [], running: false, collapsed: true, expanded: false, openIds: [], el: null };
   }
   const block = turn.assistant.timeline;
+  if ((!block.el || !turn.el.contains(block.el)) && orphan) {
+    block.el = orphan;
+    const summaryEl = orphan.querySelector('.timeline-summary');
+    if (summaryEl) summaryEl.textContent = buildSummaryText(block.entries || [], block.running);
+  }
   if (!block.el || !turn.el.contains(block.el)) {
     const el = buildTimeline(block);
     block.el = el;
@@ -3533,54 +3691,116 @@ function renderTurnError(turn, message) {
   turn.el.appendChild(err);
 }
 
+const ACTION_CHILD_CLASS = 'action-children';
+const ACTION_STEP_LIMIT = 6;
+
+function ensureTimelineParts(stack) {
+  let children = stack.querySelector('.' + ACTION_CHILD_CLASS);
+  if (!children) {
+    children = document.createElement('div');
+    children.className = ACTION_CHILD_CLASS;
+    stack.appendChild(children);
+  }
+  return { children: children };
+}
+
 function refreshTimelineBlock(block) {
   if (!block || !block.el) return;
   const stack = block.el.querySelector('.action-stack');
   if (!stack) return;
-  const arrow = block.el.querySelector('.timeline-arrow');
   const summaryEl = block.el.querySelector('.timeline-summary');
-  let inner = stack.querySelector('.action-stack-inner');
-  if (!inner) {
-    inner = document.createElement('div');
-    inner.className = 'action-stack-inner';
-    stack.appendChild(inner);
-  }
-  const wasOpen = stack.classList.contains('is-open');
-  const openIds = {};
-  Array.from(inner.children).forEach((row) => {
-    if (row.classList.contains('is-open') && row.dataset.stepId) openIds[row.dataset.stepId] = true;
+  const arrow = block.el.querySelector('.timeline-arrow');
+  const parts = ensureTimelineParts(stack);
+  const container = parts.children;
+  const entries = block.entries || [];
+  const existing = new Map();
+  Array.from(container.children).forEach((row) => {
+    if (row.dataset.stepId) existing.set(row.dataset.stepId, row);
   });
-  inner.innerHTML = '';
-  if (block.running && (!block.entries || block.entries.length === 0)) {
-    const waiting = document.createElement('div');
-    waiting.className = 'action-row is-running';
-    const waitingHead = document.createElement('div');
-    waitingHead.className = 'action-row-head';
-    const shimmer = document.createElement('span');
-    shimmer.className = 'action-row-text shimmer';
-    shimmer.textContent = 'Đang chuẩn bị hành động';
-    waitingHead.appendChild(shimmer);
-    waiting.appendChild(waitingHead);
-    inner.appendChild(waiting);
-  }
-  (block.entries || []).forEach((step) => {
-    const row = buildStepRow(step);
-    if (step.open || openIds[step.id]) row.classList.add('is-open');
-    inner.appendChild(row);
+
+  const expanded = Boolean(block.expanded || (block.el && block.el.dataset.expanded === '1'));
+  const visibleEntries = expanded ? entries : entries.slice(-ACTION_STEP_LIMIT);
+  const visibleIds = new Set(visibleEntries.map((step) => step.id));
+
+  let cursor = container.firstElementChild;
+  visibleEntries.forEach((step) => {
+    let row = existing.get(step.id);
+    if (!row) {
+      row = buildStepRow(step);
+    } else {
+      applyStepRowState(row, step);
+      existing.delete(step.id);
+    }
+    if (row !== cursor) {
+      container.insertBefore(row, cursor || null);
+    } else {
+      cursor = cursor ? cursor.nextElementSibling : null;
+    }
+    row.classList.remove('is-hidden');
   });
-  if (wasOpen) stack.classList.add('is-open');
+  existing.forEach((row) => {
+    if (visibleIds.has(row.dataset.stepId)) return;
+    row.remove();
+  });
+
+  const hiddenCount = entries.length - visibleEntries.length;
+  let moreBtn = stack.querySelector('.action-more');
+  if (hiddenCount > 0) {
+    if (!moreBtn) {
+      moreBtn = document.createElement('button');
+      moreBtn.type = 'button';
+      moreBtn.className = 'action-more';
+      container.parentNode.insertBefore(moreBtn, container.nextSibling);
+      moreBtn.addEventListener('click', () => {
+        block.expanded = !block.expanded;
+        if (block.el) block.el.dataset.expanded = block.expanded ? '1' : '0';
+        refreshTimelineBlock(block);
+      });
+    }
+    const moreLabel = 'Hiện thêm ' + hiddenCount + ' bước trước đó';
+    if (moreBtn.textContent !== moreLabel) moreBtn.textContent = moreLabel;
+    moreBtn.classList.remove('is-hidden');
+  } else if (moreBtn) {
+    moreBtn.classList.add('is-hidden');
+  }
+
+  const open = block.collapsed === false || Boolean(block.running);
+  block.collapsed = !open;
+  stack.classList.toggle('is-open', open);
+  if (arrow) arrow.innerHTML = chevronSvg(open);
+
+  let pendingRow = null;
+  entries.forEach((entry) => {
+    if (entry.status === 'running') pendingRow = entry;
+    if (entry.status === 'running' || Boolean(entry.open)) return;
+    entry.open = false;
+  });
+  let pendingEl = stack.querySelector('.action-pending');
+  if (pendingRow) {
+    if (!pendingEl) {
+      pendingEl = document.createElement('div');
+      pendingEl.className = 'action-pending';
+      stack.appendChild(pendingEl);
+    }
+    const label = (pendingRow.summary || 'Đang thực hiện').trim();
+    const fileLabel = pendingRow.file ? ' → ' + pendingRow.file : '';
+    const nextHtml = '<span class="shimmer action-pending-text">' + escapeHtml(label + fileLabel) + '</span>';
+    if (pendingEl.dataset.label !== label + fileLabel) {
+      pendingEl.dataset.label = label + fileLabel;
+      pendingEl.innerHTML = nextHtml;
+    }
+    pendingEl.classList.remove('is-hidden');
+  } else if (pendingEl) {
+    pendingEl.classList.add('is-hidden');
+  }
+
   if (summaryEl) {
-    const text = buildSummaryText(block.entries || [], block.running);
+    const text = buildSummaryText(entries, block.running);
     if (summaryEl.textContent !== text) summaryEl.textContent = text;
     if (block.running) summaryEl.classList.add('shimmer');
     else summaryEl.classList.remove('shimmer');
   }
-  if (arrow) arrow.innerHTML = chevronSvg(wasOpen);
   scrollToBottom();
-}
-
-function inner2(stack) {
-  return stack.querySelector('.action-stack-inner');
 }
 
 function updateTimelineEntries(block, patch) {
@@ -3600,6 +3820,21 @@ function stepKindOf(name) {
   if (name === 'list_directory') return 'listed';
   if (name === 'delete_path') return 'deleted';
   return 'other';
+}
+
+function finishTimeline(turn) {
+  const block = turn && turn.assistant ? turn.assistant.timeline : null;
+  if (!block) return;
+  block.running = false;
+  (block.entries || []).forEach((entry) => {
+    if (entry.status === 'running') {
+      entry.status = 'success';
+      entry.detail = entry.detail || { kind: 'log', resultPreview: entry.summary || '' };
+    }
+  });
+  block.collapsed = true;
+  if (block.el) block.el.dataset.expanded = '0';
+  refreshTimelineBlock(block);
 }
 
 function handleSseEvent(turn, event, data) {
@@ -3635,7 +3870,7 @@ function handleSseEvent(turn, event, data) {
       open: false
     });
     refreshTimelineBlock(block);
-    persistTurnMessage(turn);
+    schedulePersistTurn(turn);
     return;
   }
   if (event === 'step_done') {
@@ -3652,11 +3887,10 @@ function handleSseEvent(turn, event, data) {
       status: data.status,
       durationMs: data.durationMs,
       detail: data.detail,
-      open: false,
       args: data.args
     });
     refreshTimelineBlock(block);
-    persistTurnMessage(turn);
+    schedulePersistTurn(turn);
     return;
   }
   if (event === 'artifact_update') {
@@ -3688,23 +3922,19 @@ function handleSseEvent(turn, event, data) {
       open: false
     });
     refreshTimelineBlock(block);
-    persistTurnMessage(turn);
+    schedulePersistTurn(turn);
     return;
   }
   if (event === 'text_delta') {
     assistant.content = data.text || assistant.content || '';
     renderTurnBody(turn);
-    persistTurnMessage(turn);
+    schedulePersistTurn(turn);
     return;
   }
   if (event === 'final_reply') {
     assistant.content = data.content || assistant.content || '';
     assistant.model = data.model || assistant.model;
-    const block = getTurnTimeline(turn);
-    if (block) {
-      block.running = false;
-      refreshTimelineBlock(block);
-    }
+    finishTimeline(turn);
     renderTurnBody(turn);
     renderTurnArtifacts(turn);
     persistTurnMessage(turn);
@@ -3713,11 +3943,7 @@ function handleSseEvent(turn, event, data) {
   if (event === 'error') {
     assistant.error = data.error || 'Request failed';
     assistant.streaming = false;
-    const block = getTurnTimeline(turn);
-    if (block) {
-      block.running = false;
-      refreshTimelineBlock(block);
-    }
+    finishTimeline(turn);
     renderTurnBody(turn);
     renderTurnError(turn, assistant.error);
     persistTurnMessage(turn);
@@ -3725,11 +3951,7 @@ function handleSseEvent(turn, event, data) {
   }
   if (event === 'done') {
     assistant.streaming = false;
-    const block = turn.assistant.timeline;
-    if (block) {
-      block.running = false;
-      refreshTimelineBlock(block);
-    }
+    finishTimeline(turn);
     renderTurnBody(turn);
   }
 }
@@ -3755,8 +3977,25 @@ function serializeTimeline(block) {
       open: false
     })),
     running: Boolean(block.running),
-    collapsed: Boolean(block.collapsed)
+    collapsed: Boolean(block.collapsed),
+    expanded: Boolean(block.expanded),
+    openIds: (block.entries || []).filter((entry) => entry.open).map((entry) => entry.id)
   };
+}
+
+let persistTimer = null;
+let persistPendingTurn = null;
+
+function schedulePersistTurn(turn) {
+  if (!turn || !turn.el) return;
+  persistPendingTurn = turn;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const target = persistPendingTurn;
+    persistPendingTurn = null;
+    if (target) persistTurnMessage(target);
+  }, 350);
 }
 
 function persistTurnMessage(turn) {
@@ -3779,6 +4018,12 @@ function persistTurnMessage(turn) {
     size: artifact.size,
     sizeHuman: artifact.sizeHuman
   }));
+  if (assistant.timeline && turn.el) {
+    turn.el.querySelectorAll('.action-row').forEach((row) => {
+      const entry = (assistant.timeline.entries || []).find((item) => item.id === row.dataset.stepId);
+      if (entry) entry.open = row.classList.contains('is-open');
+    });
+  }
   record.assistant.timeline = serializeTimeline(assistant.timeline);
   chat.updatedAt = Date.now();
   persistChats();
@@ -4155,7 +4400,7 @@ async function sendMessage() {
   const nodes = el('messages').children;
   turn.el = nodes[nodes.length - 1] || null;
   if (!turn.el) return;
-  turn.assistant.timeline = { entries: [], running: true, collapsed: true, el: null };
+  turn.assistant.timeline = { entries: [], running: true, collapsed: true, expanded: false, openIds: [], el: null };
   getTurnTimeline(turn);
 
   const history = chat.messages
