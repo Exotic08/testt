@@ -23,6 +23,157 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const WORKSPACE_MODES = ['auto', 'picker', 'root'];
+const SKILLS_DIR_NAME = 'skills';
+const SKILLS_ROOT = path.join(DEFAULT_WORKSPACE_ROOT, SKILLS_DIR_NAME);
+const AGENTS_FILE_NAME = 'AGENTS.md';
+const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-_]{0,63}$/;
+
+function ensureSkillsRoot() {
+  try {
+    fs.mkdirSync(SKILLS_ROOT, { recursive: true });
+  } catch (err) {
+    /* skills folder is created lazily when possible */
+  }
+  return SKILLS_ROOT;
+}
+
+function normalizeSkillName(name) {
+  return String(name === undefined || name === null ? '' : name)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-_]/g, '');
+}
+
+function isSafeSkillSlug(slug) {
+  return SKILL_NAME_PATTERN.test(slug) && !slug.includes('..');
+}
+
+function parseSkillFrontmatter(text) {
+  const meta = {};
+  let body = String(text || '');
+  if (body.startsWith('---')) {
+    const end = body.indexOf('---', 3);
+    if (end !== -1) {
+      const rawHeader = body.slice(3, end);
+      rawHeader.split(/\r?\n/).forEach((line) => {
+        const idx = line.indexOf(':');
+        if (idx === -1) return;
+        const key = line.slice(0, idx).trim().toLowerCase();
+        const value = line.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+        if (key) meta[key] = value;
+      });
+      body = body.slice(end + 3).replace(/^\r?\n/, '');
+    }
+  }
+  return { meta: meta, body: body };
+}
+
+function skillFilePath(name) {
+  return path.join(SKILLS_ROOT, name, 'SKILL.md');
+}
+
+function listSkills() {
+  const dir = ensureSkillsRoot();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    return [];
+  }
+  const skills = [];
+  entries.forEach((entry) => {
+    if (!entry.isDirectory()) return;
+    const manifest = path.join(dir, entry.name, 'SKILL.md');
+    if (!fs.existsSync(manifest)) return;
+    let raw = '';
+    let stat = null;
+    try {
+      raw = fs.readFileSync(manifest, 'utf8');
+      stat = fs.statSync(manifest);
+    } catch (err) {
+      return;
+    }
+    const parsed = parseSkillFrontmatter(raw);
+    const firstLine = parsed.body.split(/\r?\n/).find((line) => line.trim().length > 0) || '';
+    skills.push({
+      name: entry.name,
+      title: parsed.meta.name || entry.name,
+      description: parsed.meta.description || firstLine.replace(/^#+\s*/, '').slice(0, 140),
+      path: SKILLS_DIR_NAME + '/' + entry.name + '/SKILL.md',
+      size: stat ? stat.size : raw.length,
+      updatedAt: stat ? stat.mtime.toISOString() : null
+    });
+  });
+  skills.sort((a, b) => a.name.localeCompare(b.name));
+  return skills;
+}
+
+function readSkill(name) {
+  const slug = normalizeSkillName(name);
+  if (!slug || !isSafeSkillSlug(slug)) {
+    const err = new Error('Tên skill không hợp lệ: ' + name);
+    err.statusCode = 400;
+    throw err;
+  }
+  const manifest = skillFilePath(slug);
+  if (!fs.existsSync(manifest)) {
+    const err = new Error('Không tìm thấy skill: ' + slug);
+    err.statusCode = 404;
+    throw err;
+  }
+  const raw = fs.readFileSync(manifest, 'utf8');
+  const parsed = parseSkillFrontmatter(raw);
+  return {
+    name: slug,
+    title: parsed.meta.name || slug,
+    description: parsed.meta.description || '',
+    body: parsed.body,
+    content: raw,
+    path: SKILLS_DIR_NAME + '/' + slug + '/SKILL.md'
+  };
+}
+
+function agentsFilePath(root) {
+  return path.join(root || DEFAULT_WORKSPACE_ROOT, AGENTS_FILE_NAME);
+}
+
+function readAgentsFile(root) {
+  const target = agentsFilePath(root);
+  try {
+    if (!fs.existsSync(target)) return '';
+    return fs.readFileSync(target, 'utf8');
+  } catch (err) {
+    return '';
+  }
+}
+
+function writeAgentsFile(root, content) {
+  const target = agentsFilePath(root);
+  fs.writeFileSync(target, String(content || ''), 'utf8');
+  return target;
+}
+
+const DEFAULT_AGENTS_TEMPLATE = [
+  '# AGENTS.md',
+  '',
+  'Hướng dẫn cho agent Claudex khi làm việc trong workspace này.',
+  '',
+  '## Ngữ cảnh',
+  '- Mục tiêu của dự án: (mô tả ngắn)',
+  '- Ngôn ngữ và framework: (ví dụ Node.js, Express)',
+  '',
+  '## Quy ước',
+  '- Viết code đầy đủ, không dùng TODO hay placeholder.',
+  '- Chạy kiểm tra cú pháp và test trước khi báo hoàn thành.',
+  '- Không sửa các file hệ thống nằm ngoài workspace.',
+  '',
+  '## Lệnh thường dùng',
+  '- Cài đặt: npm install',
+  '- Chạy: npm start',
+  ''
+].join('\n');
+
 
 function normalizeRootPath(relPath) {
   return String(relPath === undefined || relPath === null ? '' : relPath)
@@ -80,6 +231,13 @@ function prepareWorkspace(input) {
       created = true;
     } else if (!fs.statSync(abs).isDirectory()) {
       throw new Error('Đường dẫn đã tồn tại và không phải thư mục: ' + relative);
+    }
+    if (!fs.existsSync(agentsFilePath(abs))) {
+      try {
+        writeAgentsFile(abs, DEFAULT_AGENTS_TEMPLATE.replace('# AGENTS.md', '# AGENTS.md (' + relative + ')'));
+      } catch (err) {
+        /* guide creation is best effort */
+      }
     }
     selection = relative;
   } else if (mode === 'picker') {
@@ -465,109 +623,556 @@ function toolDeletePath(args, ctx) {
   }
 }
 
+function copyPathRecursive(src, dest) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, dest, { recursive: true, force: true });
+}
+
+function replaceInFile(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const filepath = String((args && args.filepath) || '').trim();
+  const search = (args && args.search !== undefined) ? String(args.search) : '';
+  const replace = (args && args.replace !== undefined) ? String(args.replace) : '';
+  const flags = String((args && args.flags) || '').replace(/[^gimsuy]/g, '');
+  if (!filepath) return { ok: false, error: 'filepath is required' };
+  if (!search) return { ok: false, error: 'search is required' };
+  try {
+    const abs = safePath(filepath, root);
+    if (!fs.existsSync(abs)) return { ok: false, error: 'File not found: ' + filepath };
+    const original = fs.readFileSync(abs, 'utf8');
+    let regex;
+    try {
+      regex = new RegExp(search, flags.includes('g') ? flags : flags + 'g');
+    } catch (err) {
+      return { ok: false, error: 'Invalid regex: ' + errorMessage(err) };
+    }
+    const matches = original.match(regex);
+    const count = matches ? matches.length : 0;
+    if (count === 0) {
+      return { ok: false, error: 'No match for pattern in ' + filepath };
+    }
+    const updated = original.replace(regex, replace);
+    fs.writeFileSync(abs, updated, 'utf8');
+    const stat = fs.statSync(abs);
+    return {
+      ok: true,
+      filepath: toRelativeAt(abs, root),
+      matches: count,
+      replacements: count,
+      size: stat.size,
+      sizeHuman: formatSize(stat.size),
+      message: 'Replaced ' + count + ' match(es)'
+    };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function listDirectoryTree(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const dirpath = String((args && args.dirpath) || '.').trim() || '.';
+  const maxEntries = Math.min(Math.max(parseInt((args && args.maxEntries) || 600, 10) || 600, 10), 5000);
+  try {
+    const abs = safePath(dirpath, root);
+    if (!fs.existsSync(abs)) return { ok: false, error: 'Directory not found: ' + dirpath };
+    if (!fs.statSync(abs).isDirectory()) return { ok: false, error: 'Not a directory: ' + dirpath };
+    const lines = [];
+    const walk = (dir, prefix, depth) => {
+      if (lines.length >= maxEntries || depth > 12) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (err) {
+        return;
+      }
+      entries.sort((a, b) => {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      entries.forEach((entry, index) => {
+        if (lines.length >= maxEntries) return;
+        if (IGNORED_DIRS.has(entry.name)) return;
+        const last = index === entries.length - 1;
+        lines.push(prefix + (last ? '└── ' : '├── ') + entry.name + (entry.isDirectory() ? '/' : ''));
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), prefix + (last ? '    ' : '│   '), depth + 1);
+      });
+    };
+    walk(abs, '', 0);
+    return {
+      ok: true,
+      dirpath: toRelativeAt(abs, root) || '.',
+      tree: lines.join('\n') || '(empty)',
+      count: lines.length,
+      truncated: lines.length >= maxEntries
+    };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function globToRegex(segment) {
+  let out = '^';
+  for (const ch of segment) {
+    if (ch === '*') out += '[^/]*';
+    else if (ch === '?') out += '.';
+    else if ('\\^$.|+()[]{}'.includes(ch)) out += '\\' + ch;
+    else out += ch;
+  }
+  return new RegExp(out + '$');
+}
+
+function matchGlob(relPath, patternParts) {
+  const fileParts = relPath.split('/');
+  let fi = 0;
+  let pi = 0;
+  while (pi < patternParts.length) {
+    const segment = patternParts[pi];
+    if (segment === '**') {
+      if (pi === patternParts.length - 1) return true;
+      for (let skip = fi; skip <= fileParts.length; skip += 1) {
+        if (matchGlob(fileParts.slice(skip).join('/'), patternParts.slice(pi + 1))) return true;
+      }
+      return false;
+    }
+    if (fi >= fileParts.length) return false;
+    if (!globToRegex(segment).test(fileParts[fi])) return false;
+    fi += 1;
+    pi += 1;
+  }
+  return fi === fileParts.length;
+}
+
+function globFiles(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const pattern = String((args && args.pattern) || '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!pattern) return { ok: false, error: 'pattern is required' };
+  const maxResults = Math.min(Math.max(parseInt((args && args.maxResults) || 400, 10) || 400, 10), 3000);
+  const patternParts = pattern.split('/').filter(Boolean);
+  const prefixParts = [];
+  for (const part of patternParts) {
+    if (/[*?]/.test(part)) break;
+    prefixParts.push(part);
+  }
+  const baseRel = prefixParts.length === patternParts.length ? prefixParts.slice(0, -1).join('/') : prefixParts.join('/');
+  const results = [];
+  try {
+    const baseAbs = safePath(baseRel || '.', root);
+    if (!fs.existsSync(baseAbs)) return { ok: false, error: 'Base path not found: ' + (baseRel || '.') };
+    const walk = (dir, depth) => {
+      if (results.length >= maxResults || depth > 16) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (err) {
+        return;
+      }
+      entries.forEach((entry) => {
+        if (results.length >= maxResults) return;
+        if (IGNORED_DIRS.has(entry.name)) return;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full, depth + 1);
+          return;
+        }
+        const rel = toRelativeAt(full, root);
+        if (matchGlob(rel, patternParts)) {
+          let size = 0;
+          try {
+            size = fs.statSync(full).size;
+          } catch (err) {
+            size = 0;
+          }
+          results.push({ path: rel, size: formatSize(size) });
+        }
+      });
+    };
+    walk(baseAbs, 0);
+    return { ok: true, pattern: pattern, count: results.length, files: results, truncated: results.length >= maxResults };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function grepSearch(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const pattern = String((args && args.pattern) || '');
+  if (!pattern) return { ok: false, error: 'pattern is required' };
+  const dirpath = String((args && args.dirpath) || '.').trim() || '.';
+  const include = String((args && args.include) || '').trim();
+  const caseSensitive = Boolean(args && args.caseSensitive);
+  const maxResults = Math.min(Math.max(parseInt((args && args.maxResults) || 120, 10) || 120, 5), 600);
+  let regex;
+  try {
+    regex = new RegExp(pattern, caseSensitive ? '' : 'i');
+  } catch (err) {
+    return { ok: false, error: 'Invalid regex: ' + errorMessage(err) };
+  }
+  let includeRegex = null;
+  if (include) {
+    const escaped = include.replace(/[.+^$()|[\]{}]/g, (ch) => '\\' + ch).replace(/\*/g, '.*').replace(/\?/g, '.');
+    includeRegex = new RegExp('^' + escaped + '$');
+  }
+  const results = [];
+  try {
+    const baseAbs = safePath(dirpath, root);
+    if (!fs.existsSync(baseAbs)) return { ok: false, error: 'Directory not found: ' + dirpath };
+    const walk = (dir, depth) => {
+      if (results.length >= maxResults || depth > 12) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (err) {
+        return;
+      }
+      entries.forEach((entry) => {
+        if (results.length >= maxResults) return;
+        if (IGNORED_DIRS.has(entry.name)) return;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full, depth + 1);
+          return;
+        }
+        if (includeRegex && !includeRegex.test(entry.name)) return;
+        const ext = path.extname(entry.name).replace('.', '').toLowerCase();
+        if (!TEXT_EXTENSIONS.has(ext)) return;
+        let stat;
+        try {
+          stat = fs.statSync(full);
+        } catch (err) {
+          return;
+        }
+        if (stat.size > 1024 * 1024) return;
+        let lines = [];
+        try {
+          lines = fs.readFileSync(full, 'utf8').split('\n');
+        } catch (err) {
+          return;
+        }
+        lines.forEach((line, index) => {
+          if (results.length >= maxResults) return;
+          if (regex.test(line)) {
+            results.push({ file: toRelativeAt(full, root), line: index + 1, text: line.trim().slice(0, 240) });
+          }
+        });
+      });
+    };
+    walk(baseAbs, 0);
+    return { ok: true, pattern: pattern, count: results.length, matches: results, truncated: results.length >= maxResults };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function fileInfo(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const target = String((args && (args.targetPath !== undefined ? args.targetPath : args.filepath)) || '').trim();
+  if (!target) return { ok: false, error: 'targetPath is required' };
+  try {
+    const abs = safePath(target, root);
+    if (!fs.existsSync(abs)) return { ok: false, error: 'Path not found: ' + target };
+    const stat = fs.statSync(abs);
+    const info = {
+      ok: true,
+      path: toRelativeAt(abs, root),
+      type: stat.isDirectory() ? 'dir' : 'file',
+      size: stat.size,
+      sizeHuman: formatSize(stat.size),
+      mode: '0' + (stat.mode & 0o777).toString(8),
+      createdAt: stat.birthtime.toISOString(),
+      modifiedAt: stat.mtime.toISOString()
+    };
+    if (stat.isFile()) {
+      const ext = path.extname(abs).replace('.', '').toLowerCase();
+      info.kind = fileKind(abs);
+      if (TEXT_EXTENSIONS.has(ext)) {
+        const raw = fs.readFileSync(abs, 'utf8');
+        info.lines = raw.split('\n').length;
+        info.preview = truncateText(raw, 800);
+      }
+    } else {
+      info.entries = fs.readdirSync(abs).length;
+    }
+    return info;
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function createDirectory(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const dirpath = String((args && (args.dirpath || args.path)) || '').trim();
+  if (!dirpath) return { ok: false, error: 'dirpath is required' };
+  try {
+    const abs = safePath(dirpath, root);
+    const existed = fs.existsSync(abs);
+    fs.mkdirSync(abs, { recursive: true });
+    return { ok: true, dirpath: toRelativeAt(abs, root), existed: existed, message: existed ? 'Directory already exists' : 'Directory created' };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function movePath(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const from = String((args && (args.source || args.from)) || '').trim();
+  const to = String((args && (args.destination || args.to)) || '').trim();
+  if (!from || !to) return { ok: false, error: 'source and destination are required' };
+  try {
+    const srcAbs = safePath(from, root);
+    const destAbs = safePath(to, root);
+    if (!fs.existsSync(srcAbs)) return { ok: false, error: 'Source not found: ' + from };
+    if (srcAbs === path.resolve(root)) return { ok: false, error: 'Cannot move the workspace root' };
+    const overwrite = Boolean(args && args.overwrite);
+    if (fs.existsSync(destAbs) && !overwrite) {
+      return { ok: false, error: 'Destination already exists: ' + to };
+    }
+    fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+    if (fs.existsSync(destAbs)) fs.rmSync(destAbs, { recursive: true, force: true });
+    try {
+      fs.renameSync(srcAbs, destAbs);
+    } catch (err) {
+      copyPathRecursive(srcAbs, destAbs);
+      fs.rmSync(srcAbs, { recursive: true, force: true });
+    }
+    return { ok: true, source: toRelativeAt(srcAbs, root), destination: toRelativeAt(destAbs, root), message: 'Moved successfully' };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function copyPath(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const from = String((args && (args.source || args.from)) || '').trim();
+  const to = String((args && (args.destination || args.to)) || '').trim();
+  if (!from || !to) return { ok: false, error: 'source and destination are required' };
+  try {
+    const srcAbs = safePath(from, root);
+    const destAbs = safePath(to, root);
+    if (!fs.existsSync(srcAbs)) return { ok: false, error: 'Source not found: ' + from };
+    if (fs.existsSync(destAbs) && !Boolean(args && args.overwrite)) {
+      return { ok: false, error: 'Destination already exists: ' + to };
+    }
+    copyPathRecursive(srcAbs, destAbs);
+    return { ok: true, source: toRelativeAt(srcAbs, root), destination: toRelativeAt(destAbs, root), message: 'Copied successfully' };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function multiReadFiles(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const filepaths = Array.isArray(args && args.filepaths) ? args.filepaths : [];
+  if (filepaths.length === 0) return { ok: false, error: 'filepaths array is required' };
+  if (filepaths.length > 20) return { ok: false, error: 'Too many files (max 20)' };
+  const files = filepaths.map((filepath) => {
+    const result = toolReadFile({ filepath: filepath }, ctx);
+    return {
+      filepath: String(filepath),
+      ok: Boolean(result.ok),
+      error: result.error || null,
+      totalLines: result.totalLines || 0,
+      content: result.ok ? truncateText(result.content || '', 20000) : ''
+    };
+  });
+  return { ok: files.some((file) => file.ok), count: files.length, files: files, root: toRelativeAt(root, root) || '.' };
+}
+
+function writeManyFiles(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const files = Array.isArray(args && args.files) ? args.files : [];
+  if (files.length === 0) return { ok: false, error: 'files array is required' };
+  if (files.length > 40) return { ok: false, error: 'Too many files (max 40)' };
+  const written = [];
+  const failed = [];
+  files.forEach((item) => {
+    const result = toolWriteFile({ filepath: item.filepath, content: item.content }, ctx);
+    if (result.ok) written.push({ filepath: result.filepath, size: result.size, sizeHuman: result.sizeHuman });
+    else failed.push({ filepath: item && item.filepath, error: result.error });
+  });
+  return { ok: failed.length === 0, written: written, failed: failed };
+}
+
+function findFiles(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const name = String((args && (args.name || args.pattern)) || '').trim();
+  if (!name) return { ok: false, error: 'name is required' };
+  const abs = safePath(String((args && args.dirpath) || '.'), root);
+  try {
+    const out = execSync('find . -maxdepth 8 -name ' + JSON.stringify(name) + ' -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -n 200', {
+      cwd: abs,
+      encoding: 'utf8',
+      timeout: 15000,
+      shell: '/bin/bash',
+      maxBuffer: MAX_BUFFER
+    });
+    const matches = out.split('\n').filter(Boolean).map((line) => line.replace(/^\.\//, ''));
+    return { ok: true, name: name, count: matches.length, matches: matches };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function readSkillTool(args, ctx) {
+  const name = String((args && args.name) || '').trim();
+  try {
+    const skill = readSkill(name);
+    return { ok: true, name: skill.name, title: skill.title, description: skill.description, path: skill.path, content: truncateText(skill.body, 60000) };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function listSkillsTool() {
+  const skills = listSkills();
+  return { ok: true, count: skills.length, skills: skills };
+}
+
+function readAgentsTool(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const content = readAgentsFile(root);
+  return { ok: true, path: toRelativeAt(agentsFilePath(root), root), exists: content.length > 0, content: truncateText(content, 60000) };
+}
+
+function writeAgentsTool(args, ctx) {
+  const root = (ctx && ctx.root) || DEFAULT_WORKSPACE_ROOT;
+  const content = typeof (args && args.content) === 'string' ? args.content : '';
+  if (!content.trim()) return { ok: false, error: 'content is required' };
+  try {
+    writeAgentsFile(root, content);
+    return { ok: true, path: AGENTS_FILE_NAME, size: Buffer.byteLength(content, 'utf8'), message: 'AGENTS.md saved' };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+function webFetchTool(args) {
+  const url = String((args && args.url) || '').trim();
+  if (!/^https?:\/\//i.test(url)) return Promise.resolve({ ok: false, error: 'url must start with http:// or https://' });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  return fetch(url, { signal: controller.signal, redirect: 'follow', headers: { 'User-Agent': 'ClaudexAgentWorkspace/1.0' } })
+    .then((resp) => resp.text().then((text) => {
+      const clean = String(text || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      return { ok: true, url: resp.url, status: resp.status, contentType: resp.headers.get('content-type') || '', content: truncateText(clean || text, 40000) };
+    }))
+    .catch((err) => ({ ok: false, error: errorMessage(err) }))
+    .finally(() => clearTimeout(timer));
+}
+
 const ACTION_SUMMARY_SCHEMA = {
   type: 'string',
   description: 'Bắt buộc. Một câu tiếng Việt ngắn gọn, tự nhiên mô tả chính xác việc bạn đang làm (ví dụ: "Đang kiểm tra cấu trúc thư mục hiện tại", "Tạo file cấu hình server_config.json").'
 };
 
+function stringProp(description) {
+  return { type: 'string', description: description };
+}
+
+function boolProp(description) {
+  return { type: 'boolean', description: description };
+}
+
+function numProp(description) {
+  return { type: 'number', description: description };
+}
+
+function toolSpec(name, description, properties, required) {
+  const props = Object.assign({ action_summary: ACTION_SUMMARY_SCHEMA }, properties);
+  return {
+    type: 'function',
+    function: {
+      name: name,
+      description: description,
+      parameters: { type: 'object', properties: props, required: ['action_summary'].concat(required || []) }
+    }
+  };
+}
+
 const TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'execute_command',
-      description: 'Execute a bash/Linux shell command inside the workspace container. Use for installing packages, running scripts, git, builds and tests.',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          command: { type: 'string', description: 'The bash command to execute.' },
-          timeoutMs: { type: 'number', description: 'Optional timeout in milliseconds (default 45000, max 300000).' }
-        },
-        required: ['action_summary', 'command']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'write_file',
-      description: 'Create a new file or overwrite an existing file with UTF-8 content. Parent directories are created automatically.',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          filepath: { type: 'string', description: 'Relative path of the file inside the workspace.' },
-          content: { type: 'string', description: 'Full UTF-8 content of the file.' }
-        },
-        required: ['action_summary', 'filepath', 'content']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'edit_file',
-      description: 'Replace an exact chunk of text inside an existing file. Faster and safer than rewriting whole large files.',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          filepath: { type: 'string', description: 'Relative path of the file inside the workspace.' },
-          search: { type: 'string', description: 'Exact text to find (must match literally, including whitespace).' },
-          replace: { type: 'string', description: 'Replacement text.' }
-        },
-        required: ['action_summary', 'filepath', 'search', 'replace']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'read_file',
-      description: 'Read UTF-8 content of a file. Optionally read only a range of lines (1-indexed).',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          filepath: { type: 'string', description: 'Relative path of the file inside the workspace.' },
-          startLine: { type: 'number', description: 'Optional first line to read (1-indexed).' },
-          endLine: { type: 'number', description: 'Optional last line to read (inclusive).' }
-        },
-        required: ['action_summary', 'filepath']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_directory',
-      description: 'List files and directories with sizes and types. Recursive mode skips node_modules and .git.',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          dirpath: { type: 'string', description: 'Relative directory path (defaults to workspace root).' },
-          recursive: { type: 'boolean', description: 'Whether to walk sub-directories.' }
-        },
-        required: ['action_summary']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'delete_path',
-      description: 'Delete a file or directory recursively inside the workspace.',
-      parameters: {
-        type: 'object',
-        properties: {
-          action_summary: ACTION_SUMMARY_SCHEMA,
-          targetPath: { type: 'string', description: 'Relative path of the file or directory to delete.' }
-        },
-        required: ['action_summary', 'targetPath']
-      }
-    }
-  }
+  toolSpec('execute_command', 'Execute a bash/Linux shell command inside the workspace container. Use for installing packages, running scripts, git, builds and tests.', {
+    command: stringProp('The bash command to execute.'),
+    timeoutMs: numProp('Optional timeout in milliseconds (default 45000, max 300000).')
+  }, ['command']),
+  toolSpec('write_file', 'Create a new file or overwrite an existing file with UTF-8 content. Parent directories are created automatically.', {
+    filepath: stringProp('Relative path of the file inside the workspace.'),
+    content: stringProp('Full UTF-8 content of the file.')
+  }, ['filepath', 'content']),
+  toolSpec('edit_file', 'Replace an exact chunk of text inside an existing file. Faster and safer than rewriting whole large files.', {
+    filepath: stringProp('Relative path of the file inside the workspace.'),
+    search: stringProp('Exact text to find (must match literally, including whitespace).'),
+    replace: stringProp('Replacement text.')
+  }, ['filepath', 'search', 'replace']),
+  toolSpec('read_file', 'Read UTF-8 content of a file. Optionally read only a range of lines (1-indexed).', {
+    filepath: stringProp('Relative path of the file inside the workspace.'),
+    startLine: numProp('Optional first line to read (1-indexed).'),
+    endLine: numProp('Optional last line to read (inclusive).')
+  }, ['filepath']),
+  toolSpec('list_directory', 'List files and directories with sizes and types. Recursive mode skips node_modules and .git.', {
+    dirpath: stringProp('Relative directory path (defaults to workspace root).'),
+    recursive: boolProp('Whether to walk sub-directories.')
+  }, []),
+  toolSpec('list_directory_tree', 'Print a compact ASCII tree of a directory, skipping node_modules and .git. Better than a flat list for understanding structure.', {
+    dirpath: stringProp('Relative directory path (defaults to workspace root).'),
+    maxEntries: numProp('Maximum number of lines (default 600).')
+  }, []),
+  toolSpec('read_multiple_files', 'Read several files in one call and return each file with line numbers metadata. Max 20 files.', {
+    filepaths: { type: 'array', items: { type: 'string' }, description: 'Relative paths of the files to read.' }
+  }, ['filepaths']),
+  toolSpec('write_multiple_files', 'Create or overwrite several files in one call. Max 40 files.', {
+    files: { type: 'array', items: { type: 'object', properties: { filepath: stringProp('Relative path.'), content: stringProp('File content.') }, required: ['filepath', 'content'] }, description: 'List of files to write.' }
+  }, ['files']),
+  toolSpec('replace_in_file', 'Regex-based search and replace inside a file, optionally with flags. Use when the exact match string is too long.', {
+    filepath: stringProp('Relative path of the file.'),
+    search: stringProp('Regular expression to match.'),
+    replace: stringProp('Replacement text (supports $1 groups).'),
+    flags: stringProp('Optional regex flags, for example "gi".')
+  }, ['filepath', 'search', 'replace']),
+  toolSpec('delete_path', 'Delete a file or directory recursively inside the workspace.', {
+    targetPath: stringProp('Relative path of the file or directory to delete.')
+  }, ['targetPath']),
+  toolSpec('create_directory', 'Create a directory (and any missing parents) inside the workspace.', {
+    dirpath: stringProp('Relative directory path to create.')
+  }, ['dirpath']),
+  toolSpec('move_path', 'Move or rename a file or directory inside the workspace.', {
+    source: stringProp('Existing relative path.'),
+    destination: stringProp('Target relative path.'),
+    overwrite: boolProp('Overwrite destination when it already exists.')
+  }, ['source', 'destination']),
+  toolSpec('copy_path', 'Copy a file or directory inside the workspace.', {
+    source: stringProp('Existing relative path.'),
+    destination: stringProp('Target relative path.'),
+    overwrite: boolProp('Overwrite destination when it already exists.')
+  }, ['source', 'destination']),
+  toolSpec('file_info', 'Return metadata for a path: type, size, permissions, timestamps, line count and a short preview.', {
+    targetPath: stringProp('Relative path of the file or directory.')
+  }, ['targetPath']),
+  toolSpec('glob_files', 'Find files by glob pattern such as "**/*.js" or "src/**/*.css". Ignores node_modules and .git.', {
+    pattern: stringProp('Glob pattern relative to the workspace root.'),
+    maxResults: numProp('Maximum number of results (default 400).')
+  }, ['pattern']),
+  toolSpec('find_files', 'Find files by exact name using the system find command.', {
+    name: stringProp('File name pattern, for example "*.json".'),
+    dirpath: stringProp('Directory to search in (default workspace root).')
+  }, ['name']),
+  toolSpec('grep_search', 'Search text or regex across text files and return matching lines with file and line number.', {
+    pattern: stringProp('Text or regular expression to search for.'),
+    include: stringProp('Optional file name glob filter, for example "*.md".'),
+    dirpath: stringProp('Directory to search in (default workspace root).'),
+    caseSensitive: boolProp('Match case when true.'),
+    maxResults: numProp('Maximum number of matches (default 120).')
+  }, ['pattern']),
+  toolSpec('list_skills', 'List every skill stored under the skills folder and their descriptions. Use before invoking a skill.', {}, []),
+  toolSpec('read_skill', 'Load the full instructions of a skill by name. Always call this before applying a skill.', {
+    name: stringProp('Skill folder name, for example "web-testing".')
+  }, ['name']),
+  toolSpec('read_agents_file', 'Read the AGENTS.md guide of the current workspace for project specific instructions.', {}, []),
+  toolSpec('write_agents_file', 'Create or update the AGENTS.md guide of the current workspace with instructions for future runs.', {
+    content: stringProp('Full Markdown content of AGENTS.md.')
+  }, ['content']),
+  toolSpec('web_fetch', 'Fetch an http(s) URL and return its visible text content, for reading docs or references.', {
+    url: stringProp('Absolute http or https URL.')
+  }, ['url'])
 ];
 
 const TOOL_EXECUTORS = {
@@ -575,17 +1180,34 @@ const TOOL_EXECUTORS = {
   write_file: toolWriteFile,
   edit_file: toolEditFile,
   read_file: toolReadFile,
+  read_multiple_files: multiReadFiles,
+  write_multiple_files: writeManyFiles,
+  replace_in_file: replaceInFile,
   list_directory: toolListDirectory,
-  delete_path: toolDeletePath
+  list_directory_tree: listDirectoryTree,
+  create_directory: createDirectory,
+  move_path: movePath,
+  copy_path: copyPath,
+  file_info: fileInfo,
+  glob_files: globFiles,
+  find_files: findFiles,
+  grep_search: grepSearch,
+  delete_path: toolDeletePath,
+  list_skills: listSkillsTool,
+  read_skill: readSkillTool,
+  read_agents_file: readAgentsTool,
+  write_agents_file: writeAgentsTool,
+  web_fetch: webFetchTool
 };
 
 const DEFAULT_SYSTEM_PROMPT = [
   'You are Claudex, a brilliant autonomous software engineering agent operating inside a live Linux container workspace.',
-  'You have direct access to the workspace root through six tools: execute_command, write_file, edit_file, read_file, list_directory and delete_path.',
+  'You have a complete toolset: execute_command, write_file, edit_file, read_file, read_multiple_files, write_multiple_files, replace_in_file, list_directory, list_directory_tree, create_directory, move_path, copy_path, file_info, glob_files, find_files, grep_search, delete_path, list_skills, read_skill, read_agents_file, write_agents_file and web_fetch.',
+  'Skills live in the root "skills" folder as skills/<name>/SKILL.md and AGENTS.md describes each workspace. Users can invoke a skill with "/<skill-name>" at the start of a message; when that happens, call read_skill first and follow its instructions exactly.',
   'Rules:',
   '1. Every tool call MUST include the required parameter action_summary: one short, natural Vietnamese sentence describing exactly what you are doing right now (for example "Đang kiểm tra các gói phụ thuộc trong package.json" or "Tạo giao diện trang chủ đầy đủ").',
-  '2. Always inspect the workspace (list_directory / read_file) before making large changes.',
-  '3. Use write_file to create or overwrite files, and edit_file for surgical changes inside large files.',
+  '2. Read AGENTS.md and relevant skills before large changes, and always inspect files before editing them.',
+  '3. Prefer edit_file / replace_in_file for surgical edits and write_file for new files.',
   '4. Use execute_command to run builds, tests and quick checks so that the work is verified. Keep commands short and targeted.',
   '5. Never use placeholder snippets such as "// TODO" or "// ... rest of code" - always output complete, runnable code.',
   '6. When you finish, reply with a concise Markdown summary of what you built, where the files live and how to run them.',
@@ -595,8 +1217,13 @@ const DEFAULT_SYSTEM_PROMPT = [
 function extractArtifactCandidates(toolName, args) {
   const list = [];
   if (!args) return list;
-  if (toolName === 'write_file' || toolName === 'edit_file') {
+  if (toolName === 'write_file' || toolName === 'edit_file' || toolName === 'replace_in_file') {
     if (args.filepath) list.push(String(args.filepath));
+  }
+  if (toolName === 'write_multiple_files' && Array.isArray(args.files)) {
+    args.files.forEach((file) => {
+      if (file && file.filepath) list.push(String(file.filepath));
+    });
   }
   return list;
 }
@@ -646,12 +1273,25 @@ function buildArtifact(absRel, fallbackContent) {
 
 function fallbackSummary(toolName, args) {
   const a = args || {};
-  if (toolName === 'execute_command') return 'Đang chạy lệnh ' + String(a.command || '').split('\n')[0].slice(0, 60);
+  if (toolName === 'execute_command') return 'Đang chạy lệnh ' + String(a.command || '').split(String.fromCharCode(10))[0].slice(0, 60);
   if (toolName === 'write_file') return 'Đang tạo file ' + String(a.filepath || '');
-  if (toolName === 'edit_file') return 'Đang sửa file ' + String(a.filepath || '');
-  if (toolName === 'read_file') return 'Đang đọc file ' + String(a.filepath || '');
-  if (toolName === 'list_directory') return 'Đang kiểm tra thư mục ' + String(a.dirpath || '.');
+  if (toolName === 'edit_file' || toolName === 'replace_in_file') return 'Đang sửa file ' + String(a.filepath || '');
+  if (toolName === 'read_file' || toolName === 'read_multiple_files') return 'Đang đọc nội dung file';
+  if (toolName === 'write_multiple_files') return 'Đang tạo nhiều file cùng lúc';
+  if (toolName === 'list_directory' || toolName === 'list_directory_tree') return 'Đang kiểm tra thư mục ' + String(a.dirpath || '.');
+  if (toolName === 'create_directory') return 'Đang tạo thư mục ' + String(a.dirpath || '');
   if (toolName === 'delete_path') return 'Đang xóa ' + String(a.targetPath || '');
+  if (toolName === 'move_path') return 'Đang di chuyển ' + String(a.source || '') + ' → ' + String(a.destination || '');
+  if (toolName === 'copy_path') return 'Đang sao chép ' + String(a.source || '') + ' → ' + String(a.destination || '');
+  if (toolName === 'file_info') return 'Đang xem thông tin ' + String(a.targetPath || '');
+  if (toolName === 'glob_files') return 'Đang tìm file theo mẫu ' + String(a.pattern || '');
+  if (toolName === 'find_files') return 'Đang tìm file tên ' + String(a.name || '');
+  if (toolName === 'grep_search') return 'Đang tìm nội dung ' + String(a.pattern || '');
+  if (toolName === 'list_skills') return 'Đang xem danh sách skill';
+  if (toolName === 'read_skill') return 'Đang nạp skill ' + String(a.name || '');
+  if (toolName === 'read_agents_file') return 'Đang đọc AGENTS.md của workspace';
+  if (toolName === 'write_agents_file') return 'Đang cập nhật AGENTS.md';
+  if (toolName === 'web_fetch') return 'Đang đọc nội dung ' + String(a.url || '');
   return 'Đang thực hiện ' + toolName;
 }
 
@@ -777,6 +1417,29 @@ function buildStepDetail(toolName, args, result, status, resultPreview) {
       content: truncateText(result.content, 20000)
     };
   }
+  if (toolName === 'list_skills' && result && Array.isArray(result.skills)) {
+    return { kind: 'list', dirpath: 'skills', entries: result.skills.map((skill) => ({ path: skill.name + ' - ' + (skill.description || ''), type: 'file', size: skill.size, sizeHuman: formatSize(skill.size || 0) })) };
+  }
+  if ((toolName === 'read_skill' || toolName === 'read_agents_file' || toolName === 'web_fetch') && result && typeof result.content === 'string') {
+    return { kind: 'read', filepath: result.path || result.url || toolName, startLine: 1, endLine: null, totalLines: null, content: truncateText(result.content, 20000) };
+  }
+  if (toolName === 'list_directory_tree' && result && typeof result.tree === 'string') {
+    return { kind: 'read', filepath: result.dirpath || '.', startLine: 1, endLine: null, totalLines: result.count || null, content: result.tree };
+  }
+  if (toolName === 'glob_files' && result && Array.isArray(result.files)) {
+    return { kind: 'list', dirpath: result.pattern || '.', entries: result.files.map((file) => ({ path: file.path, type: 'file', size: 0, sizeHuman: file.size || '' })) };
+  }
+  if (toolName === 'find_files' && result && Array.isArray(result.matches)) {
+    return { kind: 'list', dirpath: result.name || '.', entries: result.matches.map((match) => ({ path: match, type: 'file', size: 0, sizeHuman: '' })) };
+  }
+  if ((toolName === 'grep_search' || toolName === 'replace_in_file') && result && (Array.isArray(result.matches) || result.matches)) {
+    const matches = result.matches || [];
+    const lines = matches.map((match) => ({ type: 'add', text: (match.file || '') + ':' + (match.line || '') + '  ' + (match.text || '') }));
+    return { kind: 'diff', filepath: result.pattern || args.pattern || '', lines: lines };
+  }
+  if (toolName === 'write_multiple_files' && result && Array.isArray(result.written)) {
+    return { kind: 'list', dirpath: '.', entries: result.written.map((file) => ({ path: file.filepath, type: 'file', size: 0, sizeHuman: file.sizeHuman || '' })) };
+  }
   if (String(toolName).indexOf('file') !== -1 && result && result.filepath && typeof result.content === 'string') {
     return {
       kind: 'read',
@@ -791,8 +1454,16 @@ function buildStepDetail(toolName, args, result, status, resultPreview) {
 }
 
 function stepFileTarget(toolName, args) {
-  if (toolName === 'write_file' || toolName === 'edit_file' || toolName === 'read_file') return String(args.filepath || '');
-  if (toolName === 'delete_path') return String(args.targetPath || '');
+  if (toolName === 'write_file' || toolName === 'edit_file' || toolName === 'read_file' || toolName === 'replace_in_file') return String(args.filepath || '');
+  if (toolName === 'delete_path' || toolName === 'file_info') return String(args.targetPath || '');
+  if (toolName === 'list_directory' || toolName === 'list_directory_tree' || toolName === 'create_directory') return String(args.dirpath || '');
+  if (toolName === 'move_path' || toolName === 'copy_path') return String(args.destination || args.source || '');
+  if (toolName === 'glob_files') return String(args.pattern || '');
+  if (toolName === 'find_files') return String(args.name || '');
+  if (toolName === 'grep_search') return String(args.include || '');
+  if (toolName === 'read_skill') return String(args.name || '');
+  if (toolName === 'read_agents_file' || toolName === 'write_agents_file') return 'AGENTS.md';
+  if (toolName === 'web_fetch') return String(args.url || '');
   return '';
 }
 
@@ -827,7 +1498,20 @@ app.post('/api/chat', async (req, res) => {
   const sse = createSseWriter(res);
 
   const client = new OpenAI({ apiKey: apiKey, baseURL: baseURL, dangerouslyAllowBrowser: false });
-  const workspaceNote = '\n\nWorking directory for this conversation: ' + workspace.root + ' (' + (workspace.relative || 'workspace root / thư mục gốc') + '). All relative paths you pass to tools are resolved inside that directory.';
+  const agentsGuide = readAgentsFile(workspace.root);
+  const skills = listSkills();
+  const skillIndex = skills.length
+    ? skills.map((skill) => '- ' + skill.name + ': ' + (skill.description || skill.title)).join(String.fromCharCode(10))
+    : '- (chưa có skill nào)';
+  const workspaceNote = [
+    '',
+    'Working directory for this conversation: ' + workspace.root + ' (' + (workspace.relative || 'workspace root / thư mục gốc') + '). All relative paths you pass to tools are resolved inside that directory.',
+    'Available skills (skills/<name>/SKILL.md) - call read_skill before using one:',
+    skillIndex,
+    agentsGuide
+      ? 'Project guide from AGENTS.md of this workspace:' + String.fromCharCode(10) + truncateText(agentsGuide, 12000)
+      : 'This workspace has no AGENTS.md yet. If the task is substantial, create one with write_agents_file describing conventions for future runs.'
+  ].join(String.fromCharCode(10));
   const conversation = [{ role: 'system', content: systemPrompt + workspaceNote }];
   for (const m of messagesIn) {
     if (!m || !m.role) continue;
@@ -984,8 +1668,11 @@ app.post('/api/chat', async (req, res) => {
               /* unresolvable artifact path */
             }
           }
-          if ((toolName === 'write_file' || toolName === 'edit_file') && fileTarget) {
+          if ((toolName === 'write_file' || toolName === 'edit_file' || toolName === 'replace_in_file') && fileTarget) {
             presentedFiles.add(fileTarget.replace(/^\.\//, ''));
+          }
+          if (toolName === 'write_multiple_files' && result && Array.isArray(result.written)) {
+            result.written.forEach((file) => presentedFiles.add(file.filepath));
           }
         }
 
@@ -1072,6 +1759,107 @@ app.post('/api/terminal', async (req, res) => {
   });
 });
 
+app.get('/api/skills', (req, res) => {
+  try {
+    ensureSkillsRoot();
+    const skills = listSkills();
+    res.json({ ok: true, root: SKILLS_DIR_NAME, dir: SKILLS_ROOT, count: skills.length, skills: skills });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post('/api/skills', (req, res) => {
+  try {
+    const body = req.body || {};
+    ensureSkillsRoot();
+    const rawSkillName = String(body.name || '').trim();
+    if (rawSkillName.includes('..') || /[\\/]/.test(rawSkillName)) {
+      return res.status(400).json({ ok: false, error: 'Tên skill không được chứa đường dẫn' });
+    }
+    const slug = normalizeSkillName(rawSkillName);
+    if (!slug || !isSafeSkillSlug(slug)) {
+      return res.status(400).json({ ok: false, error: 'Tên skill chỉ gồm chữ thường, số, dấu gạch ngang (2-64 ký tự)' });
+    }
+    const dir = path.join(SKILLS_ROOT, slug);
+    const manifest = path.join(dir, 'SKILL.md');
+    const exists = fs.existsSync(manifest);
+    if (exists && !body.overwrite) {
+      return res.status(409).json({ ok: false, error: 'Skill đã tồn tại: ' + slug });
+    }
+    const title = String(body.title || slug).trim();
+    const description = String(body.description || '').trim();
+    const content = String(body.content || '').trim();
+    if (!content) {
+      return res.status(400).json({ ok: false, error: 'Nội dung skill (content) không được để trống' });
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    const file = '---' + String.fromCharCode(10) + 'name: ' + title + String.fromCharCode(10) + 'description: ' + description.replace(/[\r\n]+/g, ' ') + String.fromCharCode(10) + '---' + String.fromCharCode(10, 10) + content + String.fromCharCode(10);
+    fs.writeFileSync(manifest, file, 'utf8');
+    res.json({ ok: true, name: slug, path: SKILLS_DIR_NAME + '/' + slug + '/SKILL.md', overwritten: exists });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.get('/api/skills/:name', (req, res) => {
+  try {
+    const skill = readSkill(req.params.name);
+    res.json({ ok: true, name: skill.name, title: skill.title, description: skill.description, path: skill.path, content: skill.body });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.delete('/api/skills/:name', (req, res) => {
+  try {
+    const rawName = String(req.params.name || '');
+    const slug = normalizeSkillName(rawName);
+    if (!slug || rawName.includes('..') || /[\\/]/.test(rawName) || !isSafeSkillSlug(slug)) {
+      return res.status(400).json({ ok: false, error: 'Tên skill không hợp lệ' });
+    }
+    const dir = path.join(SKILLS_ROOT, slug);
+    if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'Không tìm thấy skill: ' + slug });
+    fs.rmSync(dir, { recursive: true, force: true });
+    res.json({ ok: true, name: slug, message: 'Skill đã xóa' });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.get('/api/agents', (req, res) => {
+  try {
+    const root = resolveWorkspaceRoot(req.query.ws || '');
+    const content = readAgentsFile(root);
+    res.json({ ok: true, workspace: toRelativeAt(root, DEFAULT_WORKSPACE_ROOT) || '.', path: AGENTS_FILE_NAME, exists: content.length > 0, content: content });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
+app.post('/api/agents', (req, res) => {
+  try {
+    const body = req.body || {};
+    const root = resolveWorkspaceRoot(body.workspaceRoot || req.query.ws || '');
+    const action = String(body.action || 'save');
+    if (action === 'create') {
+      const target = agentsFilePath(root);
+      if (fs.existsSync(target) && !body.overwrite) {
+        return res.status(409).json({ ok: false, error: 'AGENTS.md đã tồn tại trong workspace này' });
+      }
+      writeAgentsFile(root, body.content !== undefined ? String(body.content) : DEFAULT_AGENTS_TEMPLATE);
+      return res.json({ ok: true, path: AGENTS_FILE_NAME, created: true });
+    }
+    if (typeof body.content !== 'string') {
+      return res.status(400).json({ ok: false, error: 'content is required' });
+    }
+    writeAgentsFile(root, body.content);
+    res.json({ ok: true, path: AGENTS_FILE_NAME, saved: true, size: Buffer.byteLength(body.content, 'utf8') });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ ok: false, error: errorMessage(err) });
+  }
+});
+
 app.get('/api/workspaces', (req, res) => {
   try {
     const all = listDirectory(DEFAULT_WORKSPACE_ROOT, false);
@@ -1113,6 +1901,7 @@ app.get('/api/files', (req, res) => {
       ok: true,
       root: root,
       workspaceRoot: toRelativeAt(root, DEFAULT_WORKSPACE_ROOT) || '.',
+      agentsFile: fs.existsSync(agentsFilePath(root)),
       count: entries.length,
       entries: entries,
       tree: buildTree(entries)
@@ -1689,6 +2478,37 @@ const INDEX_HTML = `<!DOCTYPE html>
   .ws-option:hover { border-color: #3E3E3A; }
   .ws-option.is-active { border-color: var(--accent); background: #241d19; }
   .ws-option-title { font-size: 12.5px; color: var(--text-main); }
+  .modal-wide { max-width: 760px; }
+  .skill-layout { display: grid; grid-template-columns: 210px 1fr; gap: 14px; margin-top: 12px; }
+  .skill-list-col { border: 1px solid var(--border-outer); border-radius: 8px; display: flex; flex-direction: column; min-height: 260px; max-height: 420px; }
+  .skill-list-head { display: flex; align-items: center; justify-content: space-between; padding: 7px 9px; border-bottom: 1px solid var(--border-row); font-size: 11px; color: var(--text-summary); }
+  .skill-list { overflow: auto; padding: 5px; display: flex; flex-direction: column; gap: 3px; }
+  .skill-row { text-align: left; padding: 6px 8px; border-radius: 6px; display: flex; flex-direction: column; gap: 2px; transition: background 0.28s var(--ease); }
+  .skill-row:hover { background: var(--bg-input); }
+  .skill-row.is-active { background: #241d19; }
+  .skill-row-name { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--text-main); }
+  .skill-row.is-active .skill-row-name { color: var(--accent); }
+  .skill-row-desc { font-size: 10px; color: var(--text-summary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skill-form-col { min-width: 0; }
+  .skill-form-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .skill-form-actions .modal-actions { margin-top: 0; }
+  .skill-form-actions .ws-hint { margin-top: 0; }
+  .slash-menu {
+    margin-bottom: 7px; background: var(--bg-side); border: 1px solid var(--border-outer);
+    border-radius: 9px; max-height: 240px; overflow: auto; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+    animation: fadeIn 0.24s var(--ease) both;
+  }
+  .slash-menu-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-summary); padding: 7px 10px 4px; }
+  .slash-menu-list { display: flex; flex-direction: column; padding: 0 5px 5px; }
+  .slash-item { display: flex; align-items: baseline; gap: 8px; padding: 6px 8px; border-radius: 6px; text-align: left; transition: background 0.28s var(--ease); }
+  .slash-item:hover, .slash-item.is-active { background: var(--bg-input); }
+  .slash-item-name { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--accent); flex-shrink: 0; }
+  .slash-item-desc { font-size: 11px; color: var(--text-summary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slash-empty { padding: 8px 10px; font-size: 11px; color: var(--text-summary); }
+  .skill-chip { border-color: rgba(217, 119, 87, 0.5); color: var(--accent); }
+  @media (max-width: 720px) {
+    .skill-layout { grid-template-columns: 1fr; }
+  }
   .ws-option.is-active .ws-option-title { color: var(--accent); }
   .ws-option-desc { font-size: 11px; color: var(--text-summary); line-height: 1.45; }
   .ws-picker { margin-top: 12px; }
@@ -1862,6 +2682,14 @@ const INDEX_HTML = `<!DOCTYPE html>
         <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.3" fill="none" stroke="currentColor" stroke-width="1.2"></circle><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path></svg>
         <span class="sidebar-label">Settings</span>
       </button>
+      <button id="skillsBtn" class="btn-settings">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.9l2 1.2 2.3-.2.6 2.2 1.9 1.3-1 2.1.4 2.3-2.2.7-1.3 1.9-2.1-1-2.3.4-.7-2.2-1.9-1.3 1-2.1-.4-2.3 2.2-.7z" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"></path><circle cx="8" cy="8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.1"></circle></svg>
+        <span class="sidebar-label">Skills</span>
+      </button>
+      <button id="agentsBtn" class="btn-settings">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.4 1.8h5.1l3.1 3.1v9.3H3.4z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"></path><path d="M8.5 1.8v3.1h3.1M5.2 8.4h4.6M5.2 10.6h4.6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"></path></svg>
+        <span class="sidebar-label">AGENTS.md</span>
+      </button>
     </div>
   </aside>
 
@@ -1905,6 +2733,11 @@ const INDEX_HTML = `<!DOCTYPE html>
 
     <div class="composer-wrap">
       <div class="composer-shell">
+        <div id="slashMenu" class="slash-menu is-hidden">
+          <div class="slash-menu-title">Skill</div>
+          <div id="slashMenuList" class="slash-menu-list"></div>
+        </div>
+        <div id="skillChipBar" class="attachment-bar is-hidden"></div>
         <div id="attachmentBar" class="attachment-bar is-hidden"></div>
         <div id="composer" class="composer">
           <textarea id="input" rows="1" placeholder="How can I help you today?" aria-label="Nhập tin nhắn"></textarea>
@@ -2000,6 +2833,73 @@ const INDEX_HTML = `<!DOCTYPE html>
       </div>
     </div>
   </aside>
+</div>
+
+<div id="skillsModal" class="modal is-hidden">
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <span class="modal-title">Skills</span>
+      <button id="skillsClose" class="icon-btn" type="button" aria-label="Đóng">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path></svg>
+      </button>
+    </div>
+    <p class="ws-hint">Skill lưu tại <span class="font-mono">skills/&lt;tên&gt;/SKILL.md</span> ở thư mục gốc. Gõ <span class="font-mono">/</span> trong ô soạn tin để gọi nhanh.</p>
+    <div class="skill-layout">
+      <div class="skill-list-col">
+        <div class="skill-list-head">
+          <span>Danh sách</span>
+          <button id="skillNewBtn" class="btn-small" type="button">Thêm skill</button>
+        </div>
+        <div id="skillList" class="skill-list"></div>
+      </div>
+      <div class="skill-form-col">
+        <label class="field">
+          <span class="field-label">Tên skill (chữ thường, gạch ngang)</span>
+          <input id="skillName" type="text" placeholder="web-testing" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Tiêu đề</span>
+          <input id="skillTitle" type="text" placeholder="Kiểm thử giao diện web" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Mô tả ngắn</span>
+          <input id="skillDesc" type="text" placeholder="Dùng khi cần kiểm thử UI bằng trình duyệt" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field-label">Nội dung SKILL.md</span>
+          <textarea id="skillContent" rows="9" class="font-mono" placeholder="# Hướng dẫn&#10;1. Bước một...&#10;2. Bước hai..."></textarea>
+        </label>
+        <div class="skill-form-actions">
+          <span id="skillHint" class="ws-hint"></span>
+          <div class="modal-actions">
+            <button id="skillDeleteBtn" class="btn-ghost" type="button">Xóa</button>
+            <button id="skillSaveBtn" class="btn-confirm" type="button">Lưu skill</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="agentsModal" class="modal is-hidden">
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <span class="modal-title">AGENTS.md của workspace</span>
+      <button id="agentsClose" class="icon-btn" type="button" aria-label="Đóng">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path></svg>
+      </button>
+    </div>
+    <p id="agentsMeta" class="ws-hint"></p>
+    <label class="field">
+      <span class="field-label">Nội dung AGENTS.md</span>
+      <textarea id="agentsContent" rows="14" class="font-mono"></textarea>
+    </label>
+    <div class="modal-actions">
+      <button id="agentsCreateBtn" class="btn-ghost" type="button">Tạo mẫu</button>
+      <button id="agentsCancel" class="btn-ghost" type="button">Hủy</button>
+      <button id="agentsSave" class="btn-confirm" type="button">Lưu</button>
+    </div>
+  </div>
 </div>
 
 <div id="wsModal" class="modal is-hidden">
@@ -2127,7 +3027,11 @@ const state = {
   sending: false,
   abortController: null,
   serverFiles: [],
-  workspace: { mode: 'auto', root: '', label: 'Auto workspace', active: '', created: false }
+  workspace: { mode: 'auto', root: '', label: 'Auto workspace', active: '', created: false },
+  skills: [],
+  skillMenuIndex: 0,
+  skillMenuItems: [],
+  pendingSkill: null
 };
 
 function wsQuery() {
@@ -3207,7 +4111,8 @@ async function sendMessage() {
   if (state.sending) return;
   const input = el('input');
   const text = input.value.trim();
-  if (!text && state.attachments.length === 0) return;
+  if (!text && state.attachments.length === 0 && !state.pendingSkill) return;
+  const skillName = state.pendingSkill;
   const chat = ensureChat();
   let content = text;
   if (state.attachments.length) {
@@ -3223,9 +4128,15 @@ async function sendMessage() {
   state.attachments = [];
   renderAttachments();
 
+  if (skillName) {
+    const header = '/skill ' + skillName;
+    content = header + String.fromCharCode(10, 10) + (content || 'Hãy thực hiện công việc theo skill ' + skillName + '.');
+  }
+  state.pendingSkill = null;
+  renderSkillChip();
   const record = {
     id: uid(),
-    user: { role: 'user', content: content, attachments: attachments },
+    user: { role: 'user', content: content, attachments: attachments, skill: skillName || null },
     assistant: { timeline: { entries: [], running: true, collapsed: true }, content: '', artifacts: [], streaming: true, error: null }
   };
   chat.messages.push(record);
@@ -3782,6 +4693,22 @@ function bindEvents() {
     createChat();
     el('input').focus();
   });
+  el('skillsBtn').addEventListener('click', openSkillsModal);
+  el('skillsClose').addEventListener('click', closeSkillsModal);
+  el('skillNewBtn').addEventListener('click', resetSkillForm);
+  el('skillSaveBtn').addEventListener('click', saveSkillForm);
+  el('skillDeleteBtn').addEventListener('click', deleteSkillForm);
+  el('skillsModal').addEventListener('click', (ev) => {
+    if (ev.target.id === 'skillsModal') closeSkillsModal();
+  });
+  el('agentsBtn').addEventListener('click', openAgentsModal);
+  el('agentsClose').addEventListener('click', closeAgentsModal);
+  el('agentsCancel').addEventListener('click', closeAgentsModal);
+  el('agentsSave').addEventListener('click', saveAgentsModal);
+  el('agentsCreateBtn').addEventListener('click', createAgentsTemplate);
+  el('agentsModal').addEventListener('click', (ev) => {
+    if (ev.target.id === 'agentsModal') closeAgentsModal();
+  });
   el('wsBtn').addEventListener('click', openWorkspaceModal);
   el('wsClose').addEventListener('click', closeWorkspaceModal);
   el('wsCancel').addEventListener('click', closeWorkspaceModal);
@@ -3809,8 +4736,35 @@ function bindEvents() {
   el('stopBtn').addEventListener('click', () => {
     if (state.abortController) state.abortController.abort();
   });
-  el('input').addEventListener('input', (ev) => autoResize(ev.target));
+  el('input').addEventListener('input', (ev) => {
+    autoResize(ev.target);
+    refreshSlashMenu();
+  });
+  el('input').addEventListener('blur', () => {
+    setTimeout(hideSlashMenu, 120);
+  });
   el('input').addEventListener('keydown', (ev) => {
+    const menu = el('slashMenu');
+    const menuOpen = menu && !menu.classList.contains('is-hidden');
+    if (menuOpen && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')) {
+      ev.preventDefault();
+      const total = state.skillMenuItems.length;
+      if (total > 0) {
+        state.skillMenuIndex = (state.skillMenuIndex + (ev.key === 'ArrowDown' ? 1 : total - 1)) % total;
+        showSlashMenu(slashQuery() ? slashQuery().query : '');
+      }
+      return;
+    }
+    if (menuOpen && (ev.key === 'Enter' || ev.key === 'Tab') && state.skillMenuItems.length > 0) {
+      ev.preventDefault();
+      applySlashSkill(state.skillMenuIndex);
+      return;
+    }
+    if (menuOpen && ev.key === 'Escape') {
+      ev.preventDefault();
+      hideSlashMenu();
+      return;
+    }
     if (ev.key === 'Enter' && !ev.shiftKey) {
       ev.preventDefault();
       sendMessage();
@@ -3942,6 +4896,299 @@ function bindEvents() {
   el('terminalClear').addEventListener('click', () => {
     el('terminalOut').innerHTML = '';
   });
+}
+
+function renderSkillChip() {
+  const bar = el('skillChipBar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  if (!state.pendingSkill) {
+    bar.classList.add('is-hidden');
+    return;
+  }
+  bar.classList.remove('is-hidden');
+  const chip = document.createElement('div');
+  chip.className = 'attach-chip skill-chip';
+  const name = document.createElement('span');
+  name.className = 'attach-chip-name';
+  name.textContent = 'Skill: /' + state.pendingSkill;
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'attach-chip-remove';
+  remove.textContent = '×';
+  remove.title = 'Bỏ skill khỏi tin nhắn';
+  remove.addEventListener('click', () => {
+    state.pendingSkill = null;
+    renderSkillChip();
+  });
+  chip.appendChild(name);
+  chip.appendChild(remove);
+  bar.appendChild(chip);
+}
+
+function hideSlashMenu() {
+  const menu = el('slashMenu');
+  if (menu) menu.classList.add('is-hidden');
+  state.skillMenuItems = [];
+  state.skillMenuIndex = 0;
+}
+
+function slashQuery() {
+  const input = el('input');
+  const value = input.value;
+  const pos = typeof input.selectionStart === 'number' ? input.selectionStart : value.length;
+  const before = value.slice(0, pos);
+  const slashIndex = before.lastIndexOf(String.fromCharCode(47));
+  if (slashIndex === -1) return null;
+  const prefix = slashIndex === 0 ? ' ' : before.charAt(slashIndex - 1);
+  if (prefix !== ' ' && prefix !== String.fromCharCode(9) && prefix !== String.fromCharCode(10) && prefix !== String.fromCharCode(13)) return null;
+  const token = before.slice(slashIndex + 1);
+  if (!/^[a-zA-Z0-9_-]*$/.test(token)) return null;
+  return { start: slashIndex, query: token.toLowerCase(), end: pos };
+}
+
+function showSlashMenu(query) {
+  const menu = el('slashMenu');
+  const list = el('slashMenuList');
+  if (!menu || !list) return;
+  const items = (state.skills || []).filter((skill) => {
+    if (!query) return true;
+    return skill.name.includes(query) || String(skill.title || '').toLowerCase().includes(query);
+  });
+  state.skillMenuItems = items;
+  if (state.skillMenuIndex >= items.length) state.skillMenuIndex = 0;
+  list.innerHTML = '';
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'slash-empty';
+    empty.textContent = state.skills.length ? 'Không có skill khớp "' + query + '"' : 'Chưa có skill nào. Mở Skills để thêm.';
+    list.appendChild(empty);
+    menu.classList.remove('is-hidden');
+    return;
+  }
+  items.forEach((skill, index) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'slash-item' + (index === state.skillMenuIndex ? ' is-active' : '');
+    const name = document.createElement('span');
+    name.className = 'slash-item-name';
+    name.textContent = '/' + skill.name;
+    const desc = document.createElement('span');
+    desc.className = 'slash-item-desc';
+    desc.textContent = skill.description || skill.title || '';
+    row.appendChild(name);
+    row.appendChild(desc);
+    row.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      applySlashSkill(index);
+    });
+    list.appendChild(row);
+  });
+  menu.classList.remove('is-hidden');
+}
+
+function refreshSlashMenu() {
+  const query = slashQuery();
+  if (!query) {
+    hideSlashMenu();
+    return;
+  }
+  showSlashMenu(query.query);
+}
+
+function applySlashSkill(index) {
+  const skill = state.skillMenuItems[index];
+  if (!skill) return;
+  const input = el('input');
+  const query = slashQuery();
+  if (query) {
+    input.value = input.value.slice(0, query.start) + input.value.slice(query.end);
+  }
+  state.pendingSkill = skill.name;
+  renderSkillChip();
+  hideSlashMenu();
+  input.focus();
+  autoResize(input);
+}
+
+async function loadSkills() {
+  try {
+    const resp = await fetch('/api/skills');
+    const data = await resp.json();
+    if (data.ok) state.skills = data.skills || [];
+  } catch (err) {
+    state.skills = state.skills || [];
+  }
+  return state.skills;
+}
+
+function openSkillsModal() {
+  el('skillsModal').classList.remove('is-hidden');
+  el('skillHint').textContent = '';
+  el('skillHint').classList.remove('is-error');
+  loadSkills().then(() => renderSkillList());
+}
+
+function closeSkillsModal() {
+  el('skillsModal').classList.add('is-hidden');
+}
+
+function renderSkillList() {
+  const list = el('skillList');
+  list.innerHTML = '';
+  if (!state.skills.length) {
+    const empty = document.createElement('div');
+    empty.className = 'slash-empty';
+    empty.textContent = 'Chưa có skill. Bấm "Thêm skill" để tạo.';
+    list.appendChild(empty);
+    return;
+  }
+  state.skills.forEach((skill) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'skill-row' + (skill.name === el('skillName').value.trim() ? ' is-active' : '');
+    const name = document.createElement('span');
+    name.className = 'skill-row-name';
+    name.textContent = '/' + skill.name;
+    const desc = document.createElement('span');
+    desc.className = 'skill-row-desc';
+    desc.textContent = skill.description || skill.title || '';
+    row.appendChild(name);
+    row.appendChild(desc);
+    row.addEventListener('click', () => selectSkillForEdit(skill.name));
+    list.appendChild(row);
+  });
+}
+
+async function selectSkillForEdit(name) {
+  try {
+    const resp = await fetch('/api/skills/' + encodeURIComponent(name));
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Không tải được skill');
+    el('skillName').value = data.name;
+    el('skillTitle').value = data.title || '';
+    el('skillDesc').value = data.description || '';
+    el('skillContent').value = data.content || '';
+    el('skillHint').textContent = 'Đang sửa skill: ' + data.name;
+    el('skillHint').classList.remove('is-error');
+    renderSkillList();
+  } catch (err) {
+    el('skillHint').textContent = err.message;
+    el('skillHint').classList.add('is-error');
+  }
+}
+
+function resetSkillForm() {
+  el('skillName').value = '';
+  el('skillTitle').value = '';
+  el('skillDesc').value = '';
+  el('skillContent').value = '';
+  el('skillHint').textContent = 'Tạo skill mới.';
+  el('skillHint').classList.remove('is-error');
+  renderSkillList();
+  el('skillName').focus();
+}
+
+async function saveSkillForm() {
+  const payload = {
+    name: el('skillName').value.trim(),
+    title: el('skillTitle').value.trim(),
+    description: el('skillDesc').value.trim(),
+    content: el('skillContent').value,
+    overwrite: true
+  };
+  if (!payload.name || !payload.content.trim()) {
+    el('skillHint').textContent = 'Cần tên skill và nội dung SKILL.md.';
+    el('skillHint').classList.add('is-error');
+    return;
+  }
+  try {
+    const resp = await fetch('/api/skills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Lưu skill thất bại');
+    el('skillHint').textContent = 'Đã lưu: skills/' + data.name + '/SKILL.md';
+    el('skillHint').classList.remove('is-error');
+    await loadSkills();
+    renderSkillList();
+  } catch (err) {
+    el('skillHint').textContent = err.message;
+    el('skillHint').classList.add('is-error');
+  }
+}
+
+async function deleteSkillForm() {
+  const name = el('skillName').value.trim();
+  if (!name) return;
+  if (!window.confirm('Xóa skill /' + name + '?')) return;
+  try {
+    const resp = await fetch('/api/skills/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Xóa thất bại');
+    resetSkillForm();
+    await loadSkills();
+    renderSkillList();
+    el('skillHint').textContent = 'Đã xóa skill ' + name;
+  } catch (err) {
+    el('skillHint').textContent = err.message;
+    el('skillHint').classList.add('is-error');
+  }
+}
+
+async function openAgentsModal() {
+  el('agentsModal').classList.remove('is-hidden');
+  const meta = el('agentsMeta');
+  meta.textContent = 'Đang tải...';
+  try {
+    const resp = await fetch('/api/agents' + wsParam('?'));
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Không đọc được AGENTS.md');
+    el('agentsContent').value = data.content || '';
+    meta.textContent = 'Workspace: ' + data.workspace + (data.exists ? ' · đã có AGENTS.md' : ' · chưa có AGENTS.md');
+  } catch (err) {
+    meta.textContent = err.message;
+  }
+}
+
+function closeAgentsModal() {
+  el('agentsModal').classList.add('is-hidden');
+}
+
+async function saveAgentsModal() {
+  const content = el('agentsContent').value;
+  try {
+    const resp = await fetch('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content, workspaceRoot: state.workspace.active || '' })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Lưu thất bại');
+    el('agentsMeta').textContent = 'Đã lưu AGENTS.md cho workspace ' + (state.workspace.active || 'gốc');
+    refreshFileTree();
+  } catch (err) {
+    el('agentsMeta').textContent = err.message;
+  }
+}
+
+async function createAgentsTemplate() {
+  try {
+    const resp = await fetch('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'create', overwrite: true, workspaceRoot: state.workspace.active || '' })
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Tạo mẫu thất bại');
+    await openAgentsModal();
+    el('agentsMeta').textContent = 'Đã tạo AGENTS.md mẫu cho workspace ' + (state.workspace.active || 'gốc');
+    refreshFileTree();
+  } catch (err) {
+    el('agentsMeta').textContent = err.message;
+  }
 }
 
 function openWorkspaceModal() {
@@ -4081,6 +5328,7 @@ async function init() {
   setModelBadge();
   applyWorkspaceBadge();
   bindEvents();
+  loadSkills();
   window.__claudexReady = true;
   fetchStats();
   setInterval(fetchStats, 10000);
