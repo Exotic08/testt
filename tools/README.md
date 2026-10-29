@@ -51,7 +51,7 @@ Lúc khởi động server nạp `externalToolRegistry`/`externalToolSpecs`, g�
 
 ## start.js (Docker entrypoint)
 
-`start.js` là entrypoint cho Pterodactyl/Docker: mỗi lần restart nó tự `git fetch` (hoặc `git clone` nếu chưa có repo), cập nhật code, cài dependency khi thiếu, rồi chạy `server.js` và giám sát tiến trình (tự khởi động lại nếu crash, dừng theo SIGTERM). File `.env`, `.agent/` và `node_modules/` được giữ nguyên qua mỗi lần cập nhật.
+`start.js` là entrypoint cho Pterodactyl/Docker: mỗi lần restart nó tự `git fetch` (hoặc `git clone` nếu chưa có repo, clone tạm ngay trong thư mục app để chạy được cả khi thư mục cha chỉ đọc), cập nhật code, cài dependency khi thiếu, rồi chạy `server.js` và giám sát tiến trình (tự khởi động lại nếu crash, dừng theo SIGTERM). File `.env`, `.agent/` và `node_modules/` được giữ nguyên qua mỗi lần cập nhật.
 
 | biến môi trường | mặc định | ý nghĩa |
 |---|---|---|
@@ -61,4 +61,5 @@ Lúc khởi động server nạp `externalToolRegistry`/`externalToolSpecs`, g�
 | `AUTO_UPDATE` | `1` | `0` để tắt cập nhật |
 | `NPM_INSTALL` | `auto` | `always` / `never` |
 | `START_ENTRY` | `server.js` | file khởi chạy |
+| `START_NODE_MODULES` | (trống) | thư mục `node_modules` có sẵn để symlink khi không cài được |
 | `START_LOG_FILE` | (trống) | ghi log start.js ra file |

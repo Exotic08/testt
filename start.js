@@ -140,34 +140,60 @@ function restoreProtected(backupDir) {
   }
 }
 
+function directoryHasFiles(directory) {
+  try {
+    return fs.readdirSync(directory).length > 0;
+  } catch (err) {
+    return false;
+  }
+}
+
+function copyTreeIntoAppDir(sourceDir, skipNames) {
+  const skip = new Set(skipNames || []);
+  const entries = fs.readdirSync(sourceDir);
+  for (const entry of entries) {
+    if (skip.has(entry)) continue;
+    fs.cpSync(path.join(sourceDir, entry), path.join(APP_DIR, entry), { recursive: true, force: true });
+  }
+}
+
 function cloneRepository() {
   if (!CONFIG.repoUrl) {
     log('warn', 'GIT_REPO_URL is empty, running without repository');
     return false;
   }
-  const parent = path.dirname(APP_DIR);
   const targetName = path.basename(APP_DIR);
-  const tempDir = path.join(parent, '.clone-' + process.pid);
+  const tempDir = path.join(APP_DIR, '.clone-' + process.pid);
   log('info', 'cloning ' + CONFIG.repoUrl + ' (' + CONFIG.branch + ') into ' + APP_DIR);
   try {
+    fs.mkdirSync(APP_DIR, { recursive: true });
     fs.rmSync(tempDir, { recursive: true, force: true });
   } catch (err) {
-    log('warn', 'cannot clean temporary clone directory: ' + err.message);
+    log('warn', 'cannot prepare temporary clone directory inside app dir: ' + err.message);
   }
   const clone = git(['clone', '--depth', '1', '--branch', CONFIG.branch, CONFIG.repoUrl, tempDir], { timeoutMs: 300000 });
   if (!clone.ok) {
-    log('error', 'git clone failed', toLine(clone.stderr || clone.stdout));
-    return false;
+    const retry = git(['clone', '--depth', '1', '--branch', CONFIG.branch, CONFIG.repoUrl, tempDir], { timeoutMs: 300000, cwd: APP_DIR });
+    if (!retry.ok) {
+      log('error', 'git clone failed', toLine(retry.stderr || retry.stdout || clone.stderr));
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (err) {
+        log('warn', 'cannot remove temporary clone: ' + err.message);
+      }
+      return false;
+    }
   }
   const backupDir = makeProtectedCopy();
+  const appBaseline = new Set(['.env', '.agent', 'node_modules']);
+  if (backupDir) appBaseline.add(path.basename(backupDir));
+  appBaseline.add(path.basename(tempDir));
   try {
     fs.mkdirSync(APP_DIR, { recursive: true });
-    const entries = fs.readdirSync(tempDir);
-    for (const entry of entries) {
-      if (entry === '.git') continue;
-      fs.cpSync(path.join(tempDir, entry), path.join(APP_DIR, entry), { recursive: true, force: true });
-    }
+    const hasExistingFiles = directoryHasFiles(APP_DIR) && fs.readdirSync(APP_DIR).some((entry) => !appBaseline.has(entry) && !entry.startsWith('.start-backup-'));
+    copyTreeIntoAppDir(tempDir, ['.git']);
     fs.cpSync(path.join(tempDir, '.git'), path.join(APP_DIR, '.git'), { recursive: true, force: true });
+    if (hasExistingFiles) log('info', 'existing files were overwritten by the fresh clone');
   } catch (err) {
     log('error', 'cannot copy cloned files: ' + err.message);
   }
@@ -186,10 +212,18 @@ function pullUpdates() {
     log('info', 'AUTO_UPDATE=0, skipping update');
     return true;
   }
-  if (!hasGit()) return true;
+  if (!hasGit()) {
+    if (!fs.existsSync(path.join(APP_DIR, CONFIG.entry))) {
+      log('error', 'git is not available and ' + CONFIG.entry + ' is missing; upload the files or install git');
+      return false;
+    }
+    return true;
+  }
 
   if (!isGitRepo()) {
-    return cloneRepository();
+    const cloned = cloneRepository();
+    if (!cloned) return false;
+    return true;
   }
 
   const remoteCheck = git(['remote', 'get-url', CONFIG.remote], { timeoutMs: 15000 });
@@ -249,6 +283,31 @@ function pullUpdates() {
   return true;
 }
 
+function fallbackLinkNodeModules() {
+  if (fs.existsSync(path.join(APP_DIR, 'node_modules'))) return true;
+  const candidates = [];
+  try {
+    let current = path.dirname(APP_DIR);
+    while (current && current !== path.dirname(current)) {
+      candidates.push(path.join(current, 'node_modules'));
+      current = path.dirname(current);
+    }
+  } catch (err) {
+    /* path walk is best effort */
+  }
+  if (process.env.START_NODE_MODULES) candidates.unshift(process.env.START_NODE_MODULES);
+  const source = candidates.find((candidate) => fs.existsSync(path.join(candidate, 'express', 'package.json')));
+  if (!source) return false;
+  try {
+    fs.symlinkSync(source, path.join(APP_DIR, 'node_modules'), 'dir');
+    log('info', 'using existing node_modules from ' + source);
+    return true;
+  } catch (err) {
+    log('warn', 'cannot link node_modules: ' + err.message);
+    return false;
+  }
+}
+
 function dependenciesInstalled() {
   if (!fs.existsSync(path.join(APP_DIR, 'package.json'))) return true;
   if (!fs.existsSync(path.join(APP_DIR, 'node_modules'))) return false;
@@ -276,8 +335,8 @@ function installDependencies() {
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const install = run(npmCmd, ['install', '--omit=dev', '--no-audit', '--no-fund'], { timeoutMs: 600000 });
   if (!install.ok) {
-    log('warn', 'npm install failed, starting with existing modules', toLine(install.stderr || install.stdout));
-    return false;
+    log('warn', 'npm install failed, trying existing node_modules', toLine(install.stderr || install.stdout));
+    return fallbackLinkNodeModules();
   }
   log('info', 'dependencies installed');
   return true;
