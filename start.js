@@ -13,14 +13,21 @@ const CONFIG = {
   remote: String(process.env.GIT_REMOTE || 'origin').trim(),
   entry: String(process.env.START_ENTRY || 'server.js').trim(),
   install: String(process.env.NPM_INSTALL || 'auto').trim().toLowerCase(),
-  logFile: String(process.env.START_LOG_FILE || '').trim()
+  logFile: String(process.env.START_LOG_FILE || '').trim(),
+  token: String(process.env.GITHUB_TOKEN || process.env.GIT_TOKEN || '').trim(),
+  authUrl: String(process.env.GIT_AUTH_URL || '').trim(),
+  clean: String(process.env.CLEAN_INSTALL || '1').trim() !== '0',
+  preserve: String(process.env.PRESERVE_PATHS || '.env,.agent,node_modules,skills')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
 };
 
-const PROTECTED_FROM_RESET = [
-  '.env',
-  '.agent',
-  'node_modules'
-];
+if (CONFIG.preserve.length === 0) CONFIG.preserve = DEFAULT_PRESERVE.slice();
+
+const DEFAULT_PRESERVE = ['.env', '.agent', 'node_modules', 'skills'];
+
+const PROTECTED_FROM_RESET = DEFAULT_PRESERVE.slice();
 
 let child = null;
 let shuttingDown = false;
@@ -47,6 +54,30 @@ function log(level, message, details) {
   }
 }
 
+function authenticatedUrl(url) {
+  if (CONFIG.authUrl) return CONFIG.authUrl;
+  const token = CONFIG.token;
+  if (!token) return url;
+  const match = String(url).match(/^https:\/\/(?:[^@/]+@)?github\.com\/(.+)$/);
+  if (!match) return url;
+  return 'https://x-access-token:' + encodeURIComponent(token) + '@github.com/' + match[1];
+}
+
+function redact(text) {
+  let output = String(text || '');
+  if (CONFIG.token) output = output.split(CONFIG.token).join('***');
+  if (CONFIG.authUrl) output = output.split(CONFIG.authUrl).join('(auth-url)');
+  return output;
+}
+
+function credentialArgs() {
+  const basic = Buffer.from('x-access-token:' + (CONFIG.token || '')).toString('base64');
+  return [
+    '-c', 'credential.helper=',
+    '-c', 'http.https://github.com/.extraheader=AUTHORIZATION: basic ' + basic
+  ];
+}
+
 function run(command, args, options) {
   const settings = options || {};
   const result = spawnSync(command, args, {
@@ -70,7 +101,11 @@ function run(command, args, options) {
 }
 
 function git(args, options) {
-  return run('git', args, options);
+  const list = Array.isArray(args) ? args.slice() : [];
+  const networkCommand = list.length > 0 && ['clone', 'fetch', 'pull', 'ls-remote'].includes(list.find((item) => typeof item === 'string' && !item.startsWith('-')));
+  const fullArgs = CONFIG.token && networkCommand ? credentialArgs().concat(list) : list;
+  const result = run('git', fullArgs, options);
+  return Object.assign({}, result, { stdout: redact(result.stdout), stderr: redact(result.stderr), rawArgs: list.join(' ') });
 }
 
 function hasGit() {
@@ -148,6 +183,28 @@ function directoryHasFiles(directory) {
   }
 }
 
+function wipeAppDir(keepNames) {
+  const keep = new Set((keepNames || []).concat([], CONFIG.preserve));
+  let removed = 0;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(APP_DIR);
+  } catch (err) {
+    return removed;
+  }
+  for (const entry of entries) {
+    if (keep.has(entry)) continue;
+    if (entry.startsWith('.start-backup-') || entry.startsWith('.clone-')) continue;
+    try {
+      fs.rmSync(path.join(APP_DIR, entry), { recursive: true, force: true });
+      removed += 1;
+    } catch (err) {
+      log('warn', 'cannot remove ' + entry + ': ' + err.message);
+    }
+  }
+  return removed;
+}
+
 function copyTreeIntoAppDir(sourceDir, skipNames) {
   const skip = new Set(skipNames || []);
   const entries = fs.readdirSync(sourceDir);
@@ -171,11 +228,16 @@ function cloneRepository() {
   } catch (err) {
     log('warn', 'cannot prepare temporary clone directory inside app dir: ' + err.message);
   }
-  const clone = git(['clone', '--depth', '1', '--branch', CONFIG.branch, CONFIG.repoUrl, tempDir], { timeoutMs: 300000 });
+  const url = authenticatedUrl(CONFIG.repoUrl);
+  const clone = git(['clone', '--depth', '1', '--branch', CONFIG.branch, url, tempDir], { timeoutMs: 300000 });
   if (!clone.ok) {
-    const retry = git(['clone', '--depth', '1', '--branch', CONFIG.branch, CONFIG.repoUrl, tempDir], { timeoutMs: 300000, cwd: APP_DIR });
+    const retry = git(['clone', '--depth', '1', '--branch', CONFIG.branch, url, tempDir], { timeoutMs: 300000, cwd: APP_DIR });
     if (!retry.ok) {
-      log('error', 'git clone failed', toLine(retry.stderr || retry.stdout || clone.stderr));
+      const reason = (retry.stderr || retry.stdout || clone.stderr || '').trim();
+      log('error', 'git clone failed: ' + (reason || 'unknown error'));
+      if (reason.includes('terminal prompts disabled') || reason.includes('could not read Username') || reason.includes('Authentication failed')) {
+        log('error', 'GitHub needs a token: add GITHUB_TOKEN (repo scope) or make the repository public');
+      }
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
       } catch (err) {
@@ -190,10 +252,12 @@ function cloneRepository() {
   appBaseline.add(path.basename(tempDir));
   try {
     fs.mkdirSync(APP_DIR, { recursive: true });
-    const hasExistingFiles = directoryHasFiles(APP_DIR) && fs.readdirSync(APP_DIR).some((entry) => !appBaseline.has(entry) && !entry.startsWith('.start-backup-'));
+    if (CONFIG.clean) {
+      const removed = wipeAppDir([path.basename(tempDir), path.basename(backupDir || '')]);
+      if (removed > 0) log('info', 'cleaned ' + removed + ' existing entries before installing the repo');
+    }
     copyTreeIntoAppDir(tempDir, ['.git']);
     fs.cpSync(path.join(tempDir, '.git'), path.join(APP_DIR, '.git'), { recursive: true, force: true });
-    if (hasExistingFiles) log('info', 'existing files were overwritten by the fresh clone');
   } catch (err) {
     log('error', 'cannot copy cloned files: ' + err.message);
   }
@@ -257,6 +321,24 @@ function pullUpdates() {
     return true;
   }
 
+  if (CONFIG.clean) {
+    log('info', 'clean install: syncing working tree to ' + target + ' (keeping .env, .agent, node_modules)');
+    const backupDir = makeProtectedCopy();
+    const checkout = git(['checkout', '--force', '-B', CONFIG.branch, target], { timeoutMs: 120000 });
+    if (!checkout.ok) {
+      log('error', 'git checkout failed, keeping current version', toLine(checkout.stderr || checkout.stdout));
+      restoreProtected(backupDir);
+      return false;
+    }
+    const clean = git(['clean', '-fdx', '--', '.', ':(exclude).env', ':(exclude).agent', ':(exclude)node_modules'], { timeoutMs: 120000 });
+    if (!clean.ok) {
+      log('warn', 'git clean reported: ' + toLine(clean.stderr || clean.stdout));
+    }
+    restoreProtected(backupDir);
+    log('info', 'updated ' + (beforeSha ? beforeSha.slice(0, 7) : '(new)') + ' -> ' + incomingSha.slice(0, 7));
+    return true;
+  }
+
   const localChanges = git(['status', '--porcelain', '--untracked-files=no', '--', ':(exclude)start.js'], { timeoutMs: 20000 });
   const localChangesText = localChanges.ok ? localChanges.stdout.trim() : '';
   if (localChangesText !== '') {
@@ -283,8 +365,21 @@ function pullUpdates() {
   return true;
 }
 
+function nodeModulesUsable() {
+  try {
+    return fs.existsSync(path.join(APP_DIR, 'node_modules', 'express', 'package.json'));
+  } catch (err) {
+    return false;
+  }
+}
+
 function fallbackLinkNodeModules() {
-  if (fs.existsSync(path.join(APP_DIR, 'node_modules'))) return true;
+  if (nodeModulesUsable()) return true;
+  try {
+    if (fs.existsSync(path.join(APP_DIR, 'node_modules'))) fs.rmSync(path.join(APP_DIR, 'node_modules'), { recursive: true, force: true });
+  } catch (err) {
+    log('warn', 'cannot clear broken node_modules: ' + err.message);
+  }
   const candidates = [];
   try {
     let current = path.dirname(APP_DIR);
@@ -323,10 +418,10 @@ function dependenciesInstalled() {
 
 function installDependencies() {
   if (CONFIG.install === 'never') {
-    log('info', 'NPM_INSTALL=never, skipping dependency install');
-    return true;
+    log('info', 'NPM_INSTALL=never, checking existing node_modules');
+    return nodeModulesUsable() || fallbackLinkNodeModules();
   }
-  if (CONFIG.install === 'auto' && dependenciesInstalled()) {
+  if (CONFIG.install === 'auto' && dependenciesInstalled() && nodeModulesUsable()) {
     log('info', 'dependencies already installed');
     return true;
   }

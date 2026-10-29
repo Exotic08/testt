@@ -51,7 +51,7 @@ Lúc khởi động server nạp `externalToolRegistry`/`externalToolSpecs`, g�
 
 ## start.js (Docker entrypoint)
 
-`start.js` là entrypoint cho Pterodactyl/Docker: mỗi lần restart nó tự `git fetch` (hoặc `git clone` nếu chưa có repo, clone tạm ngay trong thư mục app để chạy được cả khi thư mục cha chỉ đọc), cập nhật code, cài dependency khi thiếu, rồi chạy `server.js` và giám sát tiến trình (tự khởi động lại nếu crash, dừng theo SIGTERM). File `.env`, `.agent/` và `node_modules/` được giữ nguyên qua mỗi lần cập nhật.
+`start.js` là entrypoint cho Pterodactyl/Docker: mỗi lần restart nó tự `git fetch` (hoặc `git clone` nếu chưa có repo, clone tạm ngay trong thư mục app để chạy được cả khi thư mục cha chỉ đọc), cập nhật code, cài dependency khi thiếu, rồi chạy `server.js` và giám sát tiến trình (tự khởi động lại nếu crash, dừng theo SIGTERM). Mặc định `CLEAN_INSTALL=1`: code cũ bị xoá sạch và thay bằng đúng bản trong repo, chỉ giữ `.env`, `.agent/`, `node_modules/`, `skills/` (hoặc đổi bằng `PRESERVE_PATHS`).
 
 | biến môi trường | mặc định | ý nghĩa |
 |---|---|---|
@@ -63,3 +63,7 @@ Lúc khởi động server nạp `externalToolRegistry`/`externalToolSpecs`, g�
 | `START_ENTRY` | `server.js` | file khởi chạy |
 | `START_NODE_MODULES` | (trống) | thư mục `node_modules` có sẵn để symlink khi không cài được |
 | `START_LOG_FILE` | (trống) | ghi log start.js ra file |
+| `GITHUB_TOKEN` | (trống) | token GitHub (scope `repo`) nếu repo private |
+| `GIT_AUTH_URL` | (trống) | URL có sẵn credential, ưu tiên hơn token |
+| `CLEAN_INSTALL` | `1` | xoá code cũ rồi cài đúng bản repo (giữ các đường dẫn `PRESERVE_PATHS`) |
+| `PRESERVE_PATHS` | `.env,.agent,node_modules,skills` | danh sách giữ lại khi clean install |
