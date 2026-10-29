@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { exec, execSync } from 'child_process';
+import { getOpenAiTools, getRegistry } from './tools/index.js';
 
 dotenv.config();
 
@@ -17,6 +18,18 @@ const MAX_STEPS_DEFAULT = 12;
 const IGNORED_DIRS = new Set(['node_modules', '.git']);
 const PROCESS_START = Date.now();
 const DEFAULT_MODEL = 'claudex-3-5-sonnet-20241022';
+
+let externalToolRegistry = new Map();
+let externalToolSpecs = [];
+try {
+  externalToolRegistry = await getRegistry({ fresh: true });
+  externalToolSpecs = await getOpenAiTools();
+  console.log('External tools loaded: ' + Array.from(externalToolRegistry.keys()).join(', '));
+} catch (err) {
+  externalToolRegistry = new Map();
+  externalToolSpecs = [];
+  console.error('External tool registry failed to load:', err);
+}
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -1543,7 +1556,7 @@ app.post('/api/chat', async (req, res) => {
       const completion = await client.chat.completions.create({
         model: model,
         messages: conversation,
-        tools: TOOLS,
+        tools: TOOLS.concat(externalToolSpecs),
         tool_choice: 'auto',
         temperature: 0.2
       });
@@ -1599,12 +1612,24 @@ app.post('/api/chat', async (req, res) => {
         let result;
         let status = 'success';
         const executor = TOOL_EXECUTORS[toolName];
-        if (!executor) {
+        const externalTool = executor ? null : externalToolRegistry.get(toolName);
+        if (!executor && !externalTool) {
           result = { ok: false, error: 'Unknown tool: ' + toolName };
           status = 'error';
         } else {
           try {
-            result = await executor(args, toolCtx);
+            if (executor) {
+              result = await executor(args, toolCtx);
+            } else {
+              const externalArgs = Object.assign({}, args, {
+                action_summary: args.action_summary || ('Đang thực hiện ' + toolName)
+              });
+              delete externalArgs.action_summary;
+              result = await externalTool.run(externalArgs, {
+                root: workspace.root,
+                timeoutMs: 10000
+              });
+            }
             if (result && result.ok === false) status = 'error';
           } catch (toolErr) {
             result = { ok: false, error: errorMessage(toolErr) };
@@ -3261,6 +3286,13 @@ function stepRowLabel(step) {
   return base + (step.file ? ' ' : '');
 }
 
+function stepToolLabel(step) {
+  if (!step) return '';
+  const text = String(step.summary || '').trim();
+  if (text) return text;
+  return String(step.name || '');
+}
+
 function buildDetailHtml(step) {
   const detail = step.detail || {};
   if (detail.kind === 'command') {
@@ -3313,7 +3345,11 @@ function applyStepRowState(row, step) {
   const textWrap = row.querySelector('.action-row-text');
   if (textWrap) {
     const lead = textWrap.querySelector('.row-lead');
-    if (lead) lead.textContent = stepRowLabel(step);
+    if (lead) {
+      const isKnownKind = step.kind && step.kind !== 'other';
+      const leadText = isKnownKind ? stepRowLabel(step) : (stepToolLabel(step) || stepRowLabel(step));
+      if (lead.textContent !== leadText) lead.textContent = leadText;
+    }
     const fileLink = textWrap.querySelector('.row-file');
     const shimmerEl = textWrap.querySelector('.shimmer');
     const summaryEl = textWrap.querySelector('.row-summary');
@@ -3396,7 +3432,8 @@ function buildStepRow(step) {
   textWrap.className = 'action-row-text';
   const lead = document.createElement('span');
   lead.className = 'row-lead';
-  lead.textContent = stepRowLabel(step);
+  const knownKind = step.kind && step.kind !== 'other';
+  lead.textContent = knownKind ? stepRowLabel(step) : (stepToolLabel(step) || stepRowLabel(step));
   textWrap.appendChild(lead);
   if (step.file) {
     const fileLink = document.createElement('span');
@@ -3412,7 +3449,7 @@ function buildStepRow(step) {
   } else if (step.status === 'running') {
     const running = document.createElement('span');
     running.className = 'shimmer';
-    running.textContent = step.summary || 'Đang thực hiện';
+    running.textContent = stepToolLabel(step) || 'Đang thực hiện';
     textWrap.appendChild(running);
   } else {
     const summary = document.createElement('span');
