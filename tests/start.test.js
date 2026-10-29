@@ -89,6 +89,24 @@ test('start.js boots the server from a temp copy and shuts down on SIGTERM', asy
   }
 });
 
+test('start.js reads settings from .env', async () => {
+  const { parseEnvFile, loadEnvFile } = await import('../start.js');
+  const parsed = parseEnvFile('AI_API_KEY=abc\n# comment\nexport SERVER_PORT = "4321"\nEMPTY=\n');
+  assert.equal(parsed.AI_API_KEY, 'abc');
+  assert.equal(parsed.SERVER_PORT, '4321');
+  assert.equal(parsed.EMPTY, '');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claudex-env-'));
+  try {
+    fs.writeFileSync(path.join(dir, '.env'), 'CLAUDEX_TEST_VAR=from-dotenv\n', 'utf8');
+    const values = parseEnvFile(fs.readFileSync(path.join(dir, '.env'), 'utf8'));
+    assert.equal(values.CLAUDEX_TEST_VAR, 'from-dotenv');
+    assert.equal(typeof loadEnvFile, 'function');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('start.js fails gracefully when the entry file is missing', async () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'claudex-noentry-'));
   try {

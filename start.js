@@ -6,28 +6,66 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const START_FILE = fileURLToPath(import.meta.url);
 const APP_DIR = path.dirname(START_FILE);
 
-const CONFIG = {
-  repoUrl: String(process.env.GIT_REPO_URL || 'https://github.com/Exotic08/testt.git').trim(),
-  branch: String(process.env.GIT_BRANCH || 'main').trim(),
-  autoUpdate: String(process.env.AUTO_UPDATE || '1').trim() !== '0',
-  remote: String(process.env.GIT_REMOTE || 'origin').trim(),
-  entry: String(process.env.START_ENTRY || 'server.js').trim(),
-  install: String(process.env.NPM_INSTALL || 'auto').trim().toLowerCase(),
-  logFile: String(process.env.START_LOG_FILE || '').trim(),
-  token: String(process.env.GITHUB_TOKEN || process.env.GIT_TOKEN || '').trim(),
-  authUrl: String(process.env.GIT_AUTH_URL || '').trim(),
-  clean: String(process.env.CLEAN_INSTALL || '1').trim() !== '0',
-  preserve: String(process.env.PRESERVE_PATHS || '.env,.agent,node_modules,skills')
+const DEFAULT_PRESERVE = ['.env', '.agent', 'node_modules', 'skills'];
+const PROTECTED_FROM_RESET = DEFAULT_PRESERVE.slice();
+
+function parseEnvFile(content) {
+  const values = {};
+  String(content || '').split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) return;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  });
+  return values;
+}
+
+function loadEnvFile() {
+  const envPath = path.join(APP_DIR, '.env');
+  if (!fs.existsSync(envPath)) return {};
+  let content = '';
+  try {
+    content = fs.readFileSync(envPath, 'utf8');
+  } catch (err) {
+    process.stdout.write('[' + new Date().toISOString() + '] [warn] cannot read .env: ' + err.message + '\n');
+    return {};
+  }
+  const values = parseEnvFile(content);
+  for (const key of Object.keys(values)) {
+    const current = process.env[key];
+    if (current === undefined || current === '') process.env[key] = values[key];
+  }
+  return values;
+}
+
+function buildConfig() {
+  const preserve = String(process.env.PRESERVE_PATHS || '.env,.agent,node_modules,skills')
     .split(',')
     .map((item) => item.trim())
-    .filter((item) => item.length > 0)
-};
+    .filter((item) => item.length > 0);
+  return {
+    repoUrl: String(process.env.GIT_REPO_URL || 'https://github.com/Exotic08/testt.git').trim(),
+    branch: String(process.env.GIT_BRANCH || 'main').trim(),
+    autoUpdate: String(process.env.AUTO_UPDATE || '1').trim() !== '0',
+    remote: String(process.env.GIT_REMOTE || 'origin').trim(),
+    entry: String(process.env.START_ENTRY || 'server.js').trim(),
+    install: String(process.env.NPM_INSTALL || 'auto').trim().toLowerCase(),
+    logFile: String(process.env.START_LOG_FILE || '').trim(),
+    token: String(process.env.GITHUB_TOKEN || process.env.GIT_TOKEN || '').trim(),
+    authUrl: String(process.env.GIT_AUTH_URL || '').trim(),
+    clean: String(process.env.CLEAN_INSTALL || '1').trim() !== '0',
+    preserve: preserve.length > 0 ? preserve : DEFAULT_PRESERVE.slice(),
+    startedAt: new Date().toISOString()
+  };
+}
 
-if (CONFIG.preserve.length === 0) CONFIG.preserve = DEFAULT_PRESERVE.slice();
+const CONFIG = buildConfig();
 
-const DEFAULT_PRESERVE = ['.env', '.agent', 'node_modules', 'skills'];
-
-const PROTECTED_FROM_RESET = DEFAULT_PRESERVE.slice();
 
 let child = null;
 let shuttingDown = false;
@@ -438,15 +476,23 @@ function installDependencies() {
 }
 
 function ensureEnvDefaults() {
-  if (process.env.SERVER_PORT) return;
   const envPath = path.join(APP_DIR, '.env');
   try {
-    if (!fs.existsSync(envPath)) return;
-    const content = fs.readFileSync(envPath, 'utf8');
-    const match = content.match(/^\s*SERVER_PORT\s*=\s*(\d+)/m);
-    if (match && !process.env.SERVER_PORT) process.env.SERVER_PORT = match[1];
+    if (fs.existsSync(envPath)) {
+      const values = parseEnvFile(fs.readFileSync(envPath, 'utf8'));
+      if (process.env.AI_API_KEY === 'your_api_key_here') delete process.env.AI_API_KEY;
+      Object.keys(values).forEach((key) => {
+        if (!key.startsWith('START_') && process.env[key] === undefined && values[key] !== '') {
+          process.env[key] = values[key];
+        }
+      });
+      if (!process.env.SERVER_PORT && values.SERVER_PORT) process.env.SERVER_PORT = values.SERVER_PORT;
+    }
   } catch (err) {
-    log('warn', 'cannot read SERVER_PORT from .env: ' + err.message);
+    log('warn', 'cannot read .env defaults: ' + err.message);
+  }
+  if (process.env.AI_API_KEY === 'your_api_key_here' || !process.env.AI_API_KEY) {
+    log('warn', 'AI_API_KEY trong .env chưa được điền (vẫn là giá trị mẫu hoặc trống)');
   }
 }
 
@@ -519,8 +565,12 @@ function shutdown(signal, exitCode) {
 }
 
 function main() {
-  log('info', 'Claudex start.js | repo=' + CONFIG.repoUrl + ' branch=' + CONFIG.branch + ' dir=' + APP_DIR);
   ensureEnvFile();
+  const loaded = loadEnvFile();
+  const keys = Object.keys(loaded);
+  log('info', 'Environment: .env loaded (' + keys.length + ' key' + (keys.length === 1 ? '' : 's') + ')' + (keys.length ? ': ' + keys.join(', ') : ''));
+  Object.assign(CONFIG, buildConfig());
+  log('info', 'Claudex start.js | repo=' + CONFIG.repoUrl + ' branch=' + CONFIG.branch + ' dir=' + APP_DIR);
   try {
     pullUpdates();
   } catch (err) {
@@ -528,11 +578,14 @@ function main() {
   }
   try {
     ensureEnvFile();
+    loadEnvFile();
+    Object.assign(CONFIG, buildConfig());
     installDependencies();
   } catch (err) {
     log('error', 'dependency step failed: ' + err.message);
   }
   ensureEnvDefaults();
+  log('info', 'Server env: SERVER_PORT=' + (process.env.SERVER_PORT || '(default)') + ', AI_MODEL=' + (process.env.AI_MODEL || '(default)') + ', AI_API_KEY=' + (process.env.AI_API_KEY ? 'set' : 'missing'));
   const started = startServer();
   if (!started) process.exit(1);
 }
@@ -550,4 +603,4 @@ if (isMain) {
   main();
 }
 
-export { main, pullUpdates, installDependencies, dependenciesInstalled, CONFIG };
+export { main, pullUpdates, installDependencies, dependenciesInstalled, CONFIG, loadEnvFile, parseEnvFile, buildConfig };
